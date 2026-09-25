@@ -12,6 +12,10 @@ mediapipe.tasks.python.vision.HandLandmarker. Он требует отдельн
     x, y          — нормализованные (0..1) координаты кончика указательного пальца
     pinching      — True, если большой и указательный пальцы сомкнуты ("щипок")
     hand_detected — видна ли рука в кадре вообще
+
+Дополнительно трекер хранит буфер последних кадров (HandSample) с точным
+временем съёмки — get_samples_since(t). Он нужен играм, которым важна
+скорость движения руки (например, бросок в дартсе).
 """
 
 import math
@@ -19,6 +23,8 @@ import os
 import threading
 import time
 import urllib.request
+from collections import deque
+from dataclasses import dataclass
 
 import cv2
 import mediapipe as mp
@@ -33,8 +39,10 @@ MODEL_URL = (
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 
 # Индексы landmark'ов в HandLandmarker те же, что были в старом API
+WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
+MIDDLE_MCP = 9
 
 # Пары точек для отрисовки скелета руки в отладочном окне
 # (тот же набор связей, что был в mp.solutions.hands.HAND_CONNECTIONS)
@@ -48,12 +56,24 @@ HAND_CONNECTIONS = [
 ]
 
 
-def ensure_model():
-    """Скачивает hand_landmarker.task рядом со скриптом, если его ещё нет."""
-    if not os.path.exists(MODEL_PATH):
-        print("[GestureTracker] Скачиваю модель hand_landmarker.task (один раз)...")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-        print("[GestureTracker] Модель сохранена:", MODEL_PATH)
+def ensure_model(url=MODEL_URL, path=MODEL_PATH):
+    """Скачивает файл модели MediaPipe рядом со скриптом, если его ещё нет."""
+    if not os.path.exists(path):
+        print(f"[MediaPipe] Скачиваю модель {os.path.basename(path)} (один раз)...")
+        urllib.request.urlretrieve(url, path)
+        print("[MediaPipe] Модель сохранена:", path)
+
+
+@dataclass
+class HandSample:
+    """Один обработанный кадр камеры (координаты нормализованы 0..1, без сглаживания)."""
+    t: float              # время съёмки кадра, time.time()
+    detected: bool        # видна ли рука
+    x: float = 0.5        # точка щипка — середина между кончиками большого и указательного
+    y: float = 0.5
+    pinch_dist: float = 1.0   # расстояние между кончиками большого и указательного
+    hand_size: float = 0.0    # запястье → основание среднего пальца (масштаб руки:
+                              # растёт, когда рука приближается к камере)
 
 
 class GestureTracker:
@@ -68,6 +88,7 @@ class GestureTracker:
         self._cursor_y = 0.5
         self._pinching = False
         self._hand_detected = False
+        self._samples = deque(maxlen=120)  # ~4 секунды истории при 30 FPS
 
         self._smooth_x = 0.5
         self._smooth_y = 0.5
@@ -89,6 +110,11 @@ class GestureTracker:
         """Возвращает (x, y, pinching, hand_detected). x,y в диапазоне 0..1."""
         with self._lock:
             return self._cursor_x, self._cursor_y, self._pinching, self._hand_detected
+
+    def get_samples_since(self, t):
+        """Возвращает кадры (HandSample), снятые строго позже момента t, по порядку."""
+        with self._lock:
+            return [s for s in self._samples if s.t > t]
 
     def _run(self):
         try:
@@ -122,6 +148,7 @@ class GestureTracker:
             ok, frame = cap.read()
             if not ok:
                 continue
+            frame_t = time.time()
 
             frame = cv2.flip(frame, 1)  # зеркалим, чтобы было интуитивно
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -133,6 +160,7 @@ class GestureTracker:
             hand_detected = False
             pinching = False
             raw_x, raw_y = self._smooth_x, self._smooth_y
+            sample = HandSample(t=frame_t, detected=False)
 
             if result.hand_landmarks:
                 hand_detected = True
@@ -146,6 +174,16 @@ class GestureTracker:
 
                 dist = math.hypot(thumb_tip.x - index_tip.x, thumb_tip.y - index_tip.y)
                 pinching = dist < self.pinch_threshold
+
+                wrist, middle_mcp = lm[WRIST], lm[MIDDLE_MCP]
+                sample = HandSample(
+                    t=frame_t,
+                    detected=True,
+                    x=(thumb_tip.x + index_tip.x) / 2,
+                    y=(thumb_tip.y + index_tip.y) / 2,
+                    pinch_dist=dist,
+                    hand_size=math.hypot(wrist.x - middle_mcp.x, wrist.y - middle_mcp.y),
+                )
 
                 if self.show_debug:
                     h, w, _ = frame.shape
@@ -164,6 +202,7 @@ class GestureTracker:
                 self._cursor_y = self._smooth_y
                 self._pinching = pinching
                 self._hand_detected = hand_detected
+                self._samples.append(sample)
 
             if self.show_debug:
                 status = "PINCH" if pinching else ("HAND" if hand_detected else "NO HAND")
