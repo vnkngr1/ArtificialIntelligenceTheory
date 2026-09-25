@@ -15,6 +15,10 @@ FaceLandmarker кроме 478 точек лица умеет выдавать «
 Для окна камеры в интерфейсе игры (core/camera_preview.py) трекер готовит
 кадр, обрезанный вокруг лица, с отмеченными глазами и зрачками — get_preview().
 
+Чтобы жест выхода «средний палец» работал и в играх глазами, трекер
+дополнительно раз в несколько кадров ищет руку моделью HandLandmarker —
+exit_gesture().
+
 Работает в отдельном потоке, как и GestureTracker. Наружу отдаёт get_state():
     face_detected — видно ли лицо
     closed_score  — насколько закрыты глаза, 0..1
@@ -39,7 +43,9 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
-from .gesture_tracker import ensure_model
+from .gesture_tracker import MODEL_PATH as HAND_MODEL_PATH
+from .gesture_tracker import MODEL_URL as HAND_MODEL_URL
+from .gesture_tracker import ensure_model, middle_finger_up
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
@@ -54,6 +60,7 @@ EYE_CORNERS = [(33, 133), (362, 263)]   # уголки правого и лев�
 IRIS_CENTERS = [468, 473]
 
 PREVIEW_SIZE = (320, 240)   # кадр для окна камеры в интерфейсе (4:3, обрезан вокруг лица)
+HAND_EVERY = 3              # руку (жест выхода) ищем в каждом 3-м кадре — это дешевле
 
 
 def gaze_ratio(lm):
@@ -74,7 +81,7 @@ def gaze_ratio(lm):
 
 class BlinkTracker:
     def __init__(self, cam_index=0, close_threshold=0.5, open_threshold=0.35,
-                 min_closed_time=0.0, preview=True):
+                 min_closed_time=0.0, preview=True, exit_gesture=True):
         """
         close_threshold — глаза считаются закрытыми выше этого значения
                           (не ниже «открытого» уровня + 0.25);
@@ -82,13 +89,15 @@ class BlinkTracker:
         min_closed_time — сколько секунд глаза должны быть закрыты, чтобы
                           засчитать моргание. 0 — мгновенно. ~0.25 — только
                           нарочно долгое моргание, случайные не срабатывают;
-        preview         — готовить кадры для окна камеры в интерфейсе.
+        preview         — готовить кадры для окна камеры в интерфейсе;
+        exit_gesture    — искать руку и жест выхода «средний палец».
         """
         self.cam_index = cam_index
         self.close_threshold = close_threshold
         self.open_threshold = open_threshold
         self.min_closed_time = min_closed_time
         self.preview = preview
+        self.detect_exit = exit_gesture
         self.error = None            # текст ошибки, если камера или модель недоступны
 
         self._lock = threading.Lock()
@@ -100,6 +109,8 @@ class BlinkTracker:
         self._preview = None
         self._preview_id = 0
         self._crop = None            # сглаженная рамка обрезки вокруг лица: (cx, cy, ширина)
+        self._exit_gesture = False
+        self._frames = 0
 
         self._open_level = 0.1       # типичное значение при открытых глазах
         self._closed_since = None
@@ -129,6 +140,16 @@ class BlinkTracker:
         веках точки радужки недостоверны."""
         with self._lock:
             return self._gaze if self._face_detected else None
+
+    def exit_gesture(self):
+        """Показан ли сейчас жест выхода «средний палец»."""
+        with self._lock:
+            return self._exit_gesture
+
+    def camera_ready(self):
+        """Трекер уже обработал хотя бы один кадр камеры."""
+        with self._lock:
+            return self._frames > 0
 
     def get_preview(self):
         """(номер кадра, RGB-кадр numpy HxWx3 вокруг лица); (0, None), пока кадров нет."""
@@ -215,6 +236,16 @@ class BlinkTracker:
             min_tracking_confidence=0.5,
         )
         landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+        hand_landmarker = None
+        if self.detect_exit:
+            try:
+                ensure_model(HAND_MODEL_URL, HAND_MODEL_PATH)
+                hand_landmarker = mp_vision.HandLandmarker.create_from_options(mp_vision.HandLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL_PATH),
+                    num_hands=1, running_mode=mp_vision.RunningMode.VIDEO,
+                    min_hand_detection_confidence=0.6, min_hand_presence_confidence=0.6))
+            except Exception as exc:
+                print("[BlinkTracker] Жест выхода недоступен — не удалось загрузить модель руки:", exc)
 
         cap = cv2.VideoCapture(self.cam_index)
         if not cap.isOpened():
@@ -234,8 +265,13 @@ class BlinkTracker:
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int((frame_t - start_time) * 1000)
             try:
-                result = landmarker.detect_for_video(mp_image, int((frame_t - start_time) * 1000))
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+                exit_gesture = None
+                if hand_landmarker is not None and self._frames % HAND_EVERY == 0:
+                    hands = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+                    exit_gesture = bool(hands.hand_landmarks) and middle_finger_up(hands.hand_landmarks[0])
             except RuntimeError:
                 # интерпретатор уже завершается (игра упала или закрылась без stop())
                 break
@@ -243,6 +279,9 @@ class BlinkTracker:
             face_detected = bool(result.face_blendshapes)
             with self._lock:
                 self._face_detected = face_detected
+                self._frames += 1
+                if exit_gesture is not None:
+                    self._exit_gesture = exit_gesture
                 if face_detected:
                     shapes = {c.category_name: c.score for c in result.face_blendshapes[0]}
                     self._score = (shapes.get("eyeBlinkLeft", 0.0) + shapes.get("eyeBlinkRight", 0.0)) / 2
@@ -257,4 +296,6 @@ class BlinkTracker:
                 self._store_preview(frame, result.face_landmarks[0] if result.face_landmarks else None)
 
         landmarker.close()
+        if hand_landmarker is not None:
+            hand_landmarker.close()
         cap.release()

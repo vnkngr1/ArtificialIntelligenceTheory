@@ -3,21 +3,27 @@
 ======================================
 
 Сам находит игры: каждая папка games/<игра>/ с файлами config.py и main.py —
-это плитка в меню. В config.py задаются название (NAME), квадратная иконка
+это строка в списке. В config.py задаются название (NAME), квадратная иконка
 (ICON), описание (DESCRIPTION), чем управлять (CONTROLS) и порядок (ORDER).
 Чтобы добавить игру — достаточно положить новую папку, лаунчер трогать не нужно.
 
-Выбор игры рукой: указательный палец ведёт курсор, щипок на плитке и
-удержание, пока не заполнится круг, — запуск. Игра запускается отдельным
-процессом; лаунчер на это время отпускает камеру (она нужна игре) и ждёт.
-ESC в игре — возврат в меню.
+Игры показаны списком, который прокручивается:
+  - щипок на игре и удержание, пока не заполнится круг, — запуск;
+  - щипок ВНЕ игр (по бокам списка, между строками) и движение руки вверх/вниз —
+    список тянется за рукой, после отпускания немного прокатывается по инерции;
+    если щипок начат на игре, но рука заметно сдвинулась по вертикали — это тоже
+    прокрутка, а не запуск.
+Игра запускается отдельным процессом; лаунчер на это время отпускает камеру
+(она нужна игре) и ждёт. ESC или жест «средний палец» в игре — возврат в меню.
 
 Управление:
-  Рука    — навести на игру, сжать пальцы (щипок) и держать ~0.6 с
-  Мышь    — клик по плитке
-  ← → ↑ ↓ + Enter — выбрать и запустить с клавиатуры
+  Рука    — навести на игру, сжать пальцы (щипок) и держать ~0.6 с;
+            щипок вне игр + движение вверх/вниз — прокрутить список
+  Мышь    — клик по игре; перетаскивание или колесо — прокрутка
+  ↑ ↓ + Enter — выбрать и запустить с клавиатуры
   K       — показать / спрятать окно камеры
   ESC     — выход
+  Средний палец (показать камере и подержать) — выход
 """
 
 import importlib.util
@@ -26,25 +32,37 @@ import os
 import subprocess
 import sys
 import time
+from collections import deque
 
 import pygame
 
 from core.camera_preview import CameraPreview, hand_status, preview_rect
+from core.display import open_window
+from core.exit_gesture import ExitGesture
 from core.gesture_tracker import GestureTracker, PinchHysteresis
+from core.one_euro import OneEuroFilter2D
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 GAMES_DIR = os.path.join(ROOT, "games")
 
 WINDOW_W, WINDOW_H = 1180, 760
 FPS = 60
-HOLD_TIME = 0.6          # сек удерживать щипок на плитке для запуска
-CAM_SMOOTHING = 0.5
+HOLD_TIME = 0.6          # сек удерживать щипок на игре для запуска
+CAM_MIN_CUTOFF = 0.5     # фильтр One Euro для курсора руки (см. core/one_euro.py)
+CAM_BETA = 10.0
 CAM_MARGIN = 0.15
 MOUSE_PRIORITY = 1.5     # сек после движения мыши курсор берётся от мыши, а не от руки
+DRAG_START = 28          # px по вертикали: щипок на игре превращается в прокрутку
+FRICTION = 5.0           # затухание инерции прокрутки, 1/с
+WHEEL_STEP = 70
 
-# область плиток и текста меню — правее окна камеры (оно в левом нижнем углу)
+# область списка и текста меню — правее окна камеры (оно в левом нижнем углу)
 CONTENT_LEFT, CONTENT_RIGHT = preview_rect(WINDOW_H).right + 24, WINDOW_W - 24
 CONTENT_X = (CONTENT_LEFT + CONTENT_RIGHT) // 2
+ITEM_W, ITEM_H, ITEM_GAP = 700, 128, 14
+ICON_SIZE = ITEM_H - 28
+LIST_X = CONTENT_X - ITEM_W // 2
+VIEW = pygame.Rect(LIST_X - 12, 138, ITEM_W + 24, WINDOW_H - 138 - 52)   # видимая часть списка
 
 BG_TOP = (30, 34, 52)
 BG_BOTTOM = (14, 16, 26)
@@ -109,27 +127,6 @@ def load_icon(game, size, font):
     return surf
 
 
-# ---------- раскладка ----------
-
-def layout(n):
-    """Прямоугольники плиток: сетка под заголовком, справа от окна камеры."""
-    cols = 3 if n <= 6 else 4
-    rows = max(1, math.ceil(n / cols))
-    gap, top, bottom = 26, 150, 70
-    left, right = CONTENT_LEFT, CONTENT_RIGHT
-    tile_w = min(290, (right - left - gap * (cols - 1)) // cols)
-    tile_h = min(int(tile_w * 1.05), (WINDOW_H - top - bottom - gap * (rows - 1)) // rows)
-    total_h = rows * tile_h + gap * (rows - 1)
-    y0 = top + (WINDOW_H - top - bottom - total_h) // 2
-    rects = []
-    for i in range(n):
-        r, c = divmod(i, cols)
-        in_row = min(cols, n - r * cols)
-        x0 = left + (right - left - (in_row * tile_w + gap * (in_row - 1))) // 2
-        rects.append(pygame.Rect(x0 + c * (tile_w + gap), y0 + r * (tile_h + gap), tile_w, tile_h))
-    return rects
-
-
 def wrap(text, font, width, max_lines=2):
     lines, line = [], ""
     for word in text.split():
@@ -154,22 +151,22 @@ class Launcher:
     def __init__(self):
         pygame.init()
         self.font_title = pygame.font.SysFont("arial", 40, bold=True)
-        self.font_name = pygame.font.SysFont("arial", 23, bold=True)
+        self.font_name = pygame.font.SysFont("arial", 25, bold=True)
         self.font = pygame.font.SysFont("arial", 17)
         self.font_small = pygame.font.SysFont("arial", 14, bold=True)
-        self.font_icon = pygame.font.SysFont("arial", 90, bold=True)
+        self.font_icon = pygame.font.SysFont("arial", 60, bold=True)
 
         self.games = discover_games()
-        self.rects = layout(len(self.games))
         self.selected = 0
+        self.scroll = 0.0
+        self.velocity = 0.0          # инерция прокрутки, px/с
+        self.press = None            # текущий щипок / нажатие мыши (см. _press)
         self.message = None
         self._open_window()
         self.background = self._render_background()
-        # иконка — сколько влезет над названием и двумя строками описания
-        icon_size = min(int(min(r.width for r in self.rects) * 0.58),
-                        min(r.height for r in self.rects) - 122) if self.rects else 150
         for g in self.games:
-            g.icon = load_icon(g, icon_size, self.font_icon)
+            g.icon = load_icon(g, ICON_SIZE, self.font_icon)
+        self.exit_gesture = ExitGesture()
         self._start_tracker()
         self.preview = CameraPreview(self.tracker, WINDOW_H)
 
@@ -177,21 +174,21 @@ class Launcher:
 
     def _open_window(self):
         pygame.display.init()
-        pygame.display.set_caption("CV-игры — меню")
-        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+        self.screen = open_window((WINDOW_W, WINDOW_H), "CV-игры — меню")
 
     def _start_tracker(self):
         self.tracker = GestureTracker(cam_index=0)
         self.tracker.start()
         self.pinch = PinchHysteresis()
+        self.hand_filter = OneEuroFilter2D(CAM_MIN_CUTOFF, CAM_BETA)
         self.last_sample_t = 0.0
-        self.hand_x = self.hand_y = 0.5
+        self.hand_pos = (WINDOW_W // 2, WINDOW_H // 2)
         self.hand_detected = False
         self.pinching = False
-        self.hold_tile = None        # плитка, на которой начат щипок
-        self.hold = 0.0              # прогресс удержания 0..1
+        self.press = None
         self.mouse_until = 0.0
-        self.cursor = (WINDOW_W // 2, WINDOW_H // 2)
+        self.cursor = self.hand_pos
+        self.exit_gesture.reset()    # после игры: жест выхода засчитается, только когда рука опустится
 
     def launch(self, index):
         game = self.games[index]
@@ -213,30 +210,99 @@ class Launcher:
         else:
             self.message = None
 
-    # ---------- ввод ----------
+    # ---------- список ----------
 
-    def tile_at(self, pos):
-        for i, rect in enumerate(self.rects):
-            if rect.collidepoint(pos):
+    @property
+    def max_scroll(self):
+        content = len(self.games) * (ITEM_H + ITEM_GAP) - ITEM_GAP
+        return max(0.0, content - VIEW.height + 16)
+
+    def item_rect(self, i):
+        y = VIEW.top + 8 + i * (ITEM_H + ITEM_GAP) - self.scroll
+        return pygame.Rect(LIST_X, round(y), ITEM_W, ITEM_H)
+
+    def item_at(self, pos):
+        if not VIEW.collidepoint(pos):
+            return None
+        for i in range(len(self.games)):
+            if self.item_rect(i).collidepoint(pos):
                 return i
         return None
 
+    def _clamp_scroll(self):
+        if self.scroll < 0 or self.scroll > self.max_scroll:
+            self.velocity = 0.0
+        self.scroll = min(max(self.scroll, 0.0), self.max_scroll)
+
+    def _ensure_visible(self, i):
+        r = self.item_rect(i)
+        if r.top < VIEW.top:
+            self.scroll -= VIEW.top - r.top + 8
+        elif r.bottom > VIEW.bottom:
+            self.scroll += r.bottom - VIEW.bottom + 8
+        self._clamp_scroll()
+
+    # ---------- щипок и мышь: нажать / вести / отпустить ----------
+
+    def _press(self, pos, t, source):
+        """Щипок (source="hand") или кнопка мыши (source="mouse") нажаты в точке pos."""
+        item = self.item_at(pos)
+        self.velocity = 0.0
+        if item is not None:
+            self.press = {"kind": "item", "item": item, "start": pos, "source": source, "hold": 0.0}
+        else:
+            self._start_drag(pos, t, source)
+
+    def _start_drag(self, pos, t, source):
+        self.press = {"kind": "drag", "start": pos, "start_scroll": self.scroll, "source": source,
+                      "trail": deque([(t, pos[1])], maxlen=30)}
+
+    def _move(self, pos, t):
+        p = self.press
+        if p is None:
+            return
+        if p["kind"] == "item" and abs(pos[1] - p["start"][1]) > DRAG_START:
+            self._start_drag(pos, t, p["source"])       # потянули по вертикали — это прокрутка
+            p = self.press
+        if p["kind"] == "drag":
+            self.scroll = p["start_scroll"] - (pos[1] - p["start"][1])     # список едет за рукой
+            self._clamp_scroll()
+            p["trail"].append((t, pos[1]))
+
+    def _release(self, pos, t):
+        p = self.press
+        self.press = None
+        if p is None:
+            return None
+        if p["kind"] == "drag":
+            # скорость за последние ~0.12 с — для прокатки по инерции
+            recent = [(tt, y) for tt, y in p["trail"] if tt >= t - 0.12]
+            if len(recent) >= 2 and recent[-1][0] > recent[0][0]:
+                self.velocity = -(recent[-1][1] - recent[0][1]) / (recent[-1][0] - recent[0][0])
+        elif p["source"] == "mouse" and self.item_at(pos) == p["item"]:
+            return p["item"]                            # клик мышью — запуск сразу
+        return None
+
     def _read_hand(self):
+        launch = None
         for sample in self.tracker.get_samples_since(self.last_sample_t):
             self.last_sample_t = sample.t
             self.hand_detected = sample.detected
             if sample.detected:
-                self.hand_x += (sample.x - self.hand_x) * CAM_SMOOTHING
-                self.hand_y += (sample.y - self.hand_y) * CAM_SMOOTHING
+                self.hand_pos = cam_to_screen(*self.hand_filter(sample.x, sample.y, sample.t))
             closed = self.pinch.update(sample)
+            hand_press = self.press is None or self.press["source"] == "hand"
             if closed and not self.pinching:
-                # удержание засчитываем, только если щипок начался на плитке
-                self.hold_tile = self.tile_at(cam_to_screen(self.hand_x, self.hand_y))
-                self.hold = 0.0
-            elif not closed:
-                self.hold_tile = None
-                self.hold = 0.0
+                if self.press is None:
+                    self._press(self.hand_pos, sample.t, "hand")
+            elif closed and hand_press:
+                self._move(self.hand_pos, sample.t)
+            elif self.pinching and hand_press:
+                launch = self._release(self.hand_pos, sample.t)
             self.pinching = closed
+        return launch
+
+    # ---------- цикл ----------
 
     def run(self):
         clock = pygame.time.Clock()
@@ -253,41 +319,61 @@ class Launcher:
                         return
                     if event.key == pygame.K_k:
                         self.preview.toggle()
-                    cols = 3 if len(self.games) <= 6 else 4
-                    step = {pygame.K_LEFT: -1, pygame.K_RIGHT: 1, pygame.K_UP: -cols, pygame.K_DOWN: cols}
-                    if event.key in step and self.games:
-                        self.selected = max(0, min(len(self.games) - 1, self.selected + step[event.key]))
+                    elif event.key in (pygame.K_UP, pygame.K_DOWN) and self.games:
+                        step = -1 if event.key == pygame.K_UP else 1
+                        self.selected = max(0, min(len(self.games) - 1, self.selected + step))
+                        self._ensure_visible(self.selected)
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE) and self.games:
                         launch = self.selected
                 elif event.type == pygame.MOUSEMOTION:
                     self.mouse_until = now + MOUSE_PRIORITY
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    tile = self.tile_at(event.pos)
-                    if tile is not None:
-                        launch = tile
+                    if self.press and self.press["source"] == "mouse":
+                        self._move(event.pos, now)
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.press is None:
+                    self._press(event.pos, now, "mouse")
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    if self.press and self.press["source"] == "mouse":
+                        launch = self._release(event.pos, now)
+                elif event.type == pygame.MOUSEWHEEL:
+                    self.scroll -= event.y * WHEEL_STEP
+                    self.velocity = 0.0
+                    self._clamp_scroll()
 
-            self._read_hand()
-            if now < self.mouse_until or not self.hand_detected:
-                self.cursor = pygame.mouse.get_pos()
-            else:
-                self.cursor = cam_to_screen(self.hand_x, self.hand_y)
-            hovered = self.tile_at(self.cursor)
-            if hovered is not None:
-                self.selected = hovered
+            hand_launch = self._read_hand()
+            if launch is None:
+                launch = hand_launch
+            mouse_cursor = now < self.mouse_until or not self.hand_detected
+            self.cursor = pygame.mouse.get_pos() if mouse_cursor else self.hand_pos
 
-            if self.pinching and self.hold_tile is not None:
-                if hovered == self.hold_tile:
-                    self.hold = min(1.0, self.hold + dt / HOLD_TIME)
-                    if self.hold >= 1.0:
-                        launch = self.hold_tile
+            dragging = self.press is not None and self.press["kind"] == "drag"
+            if not dragging and abs(self.velocity) > 1:
+                self.scroll += self.velocity * dt           # прокатка по инерции
+                self.velocity *= math.exp(-FRICTION * dt)
+                self._clamp_scroll()
+            if not dragging:
+                hovered = self.item_at(self.cursor)
+                if hovered is not None:
+                    self.selected = hovered
+
+            # удержание щипка на игре — запуск
+            p = self.press
+            if p and p["kind"] == "item" and p["source"] == "hand":
+                if self.item_at(self.hand_pos) == p["item"]:
+                    p["hold"] = min(1.0, p["hold"] + dt / HOLD_TIME)
+                    if p["hold"] >= 1.0:
+                        launch = p["item"]
                 else:
-                    self.hold_tile, self.hold = None, 0.0     # увели руку с плитки — отмена
+                    self.press = None                       # увели руку с игры — отмена
 
+            if self.exit_gesture.update(dt, self.tracker):
+                return
             if launch is not None:
+                self.press = None
                 self.launch(launch)
                 continue
 
             self._draw()
+            self.exit_gesture.draw(self.screen)
             pygame.display.flip()
 
     # ---------- отрисовка ----------
@@ -302,73 +388,106 @@ class Launcher:
     def _draw(self):
         self.screen.blit(self.background, (0, 0))
         title = self.font_title.render("CV-игры", True, TEXT)
-        self.screen.blit(title, title.get_rect(midtop=(CONTENT_X, 34)))
+        self.screen.blit(title, title.get_rect(midtop=(CONTENT_X, 30)))
         if self.message:
             self._banner(self.message, (255, 150, 150))
         else:
-            hint = "Наведите палец на игру, сожмите пальцы (щипок) и держите, пока не заполнится круг"
+            hint = "Щипок на игре и удержание — запуск.  Щипок вне игр и движение вверх/вниз — прокрутка"
             txt = self.font.render(hint, True, MUTED)
-            self.screen.blit(txt, txt.get_rect(midtop=(CONTENT_X, 88)))
+            self.screen.blit(txt, txt.get_rect(midtop=(CONTENT_X, 86)))
 
         if not self.games:
             txt = self.font_name.render("В папке games/ не найдено ни одной игры с config.py и main.py", True, TEXT)
             self.screen.blit(txt, txt.get_rect(center=(CONTENT_X, WINDOW_H // 2)))
 
-        for i, (game, rect) in enumerate(zip(self.games, self.rects)):
-            self._draw_tile(game, rect, i == self.selected, self.hold if i == self.hold_tile else 0.0)
+        self._draw_list()
 
-        footer = "Мышь: клик по плитке   ·   Стрелки + Enter   ·   K — камера   ·   ESC — выход   ·   ESC в игре — назад в меню"
+        footer = "Мышь: клик, колесо   ·   ↑ ↓ + Enter   ·   K — камера   ·   ESC или средний палец — выход"
         txt = self.font.render(footer, True, MUTED)
-        self.screen.blit(txt, txt.get_rect(midbottom=(CONTENT_X, WINDOW_H - 16)))
+        self.screen.blit(txt, txt.get_rect(midbottom=(CONTENT_X, WINDOW_H - 14)))
         status = "рука в кадре" if self.hand_detected else "рука не найдена — можно мышью"
         color = (110, 220, 140) if self.hand_detected else (240, 130, 130)
         pygame.draw.circle(self.screen, color, (26, 28), 6)
         self.screen.blit(self.font.render(status, True, color), (38, 18))
 
         self.preview.draw(self.screen, hand_status(self.hand_detected, self.pinching))
+        self._draw_cursor()
 
-        # курсор: кольцо, при щипке — красное с заполняющейся дугой удержания
-        x, y = self.cursor
-        color = (255, 80, 80) if self.pinching else (255, 255, 255)
-        pygame.draw.circle(self.screen, (0, 0, 0), (x, y), 15, 5)
-        pygame.draw.circle(self.screen, color, (x, y), 14, 3)
-        if self.hold > 0:
-            rect = pygame.Rect(0, 0, 44, 44)
-            rect.center = (x, y)
-            pygame.draw.arc(self.screen, ACCENT, rect, math.pi / 2, math.pi / 2 + 2 * math.pi * self.hold, 5)
+    def _draw_list(self):
+        self.screen.set_clip(VIEW)
+        hold_item = self.press["item"] if self.press and self.press["kind"] == "item" else None
+        hold = self.press.get("hold", 0.0) if hold_item is not None else 0.0
+        for i, game in enumerate(self.games):
+            r = self.item_rect(i)
+            if r.bottom < VIEW.top or r.top > VIEW.bottom:
+                continue
+            self._draw_item(game, r, i == self.selected, hold if i == hold_item else 0.0)
+        self.screen.set_clip(None)
 
-    def _draw_tile(self, game, rect, active, hold):
-        r = rect.inflate(10, 10) if active else rect
-        shadow = r.move(0, 6)
-        pygame.draw.rect(self.screen, (8, 9, 14), shadow, border_radius=22)
-        pygame.draw.rect(self.screen, TILE_HOVER if active else TILE, r, border_radius=22)
+        # затемнение у краёв видимой области — видно, что список продолжается
+        for edge, top in ((VIEW.top, True), (VIEW.bottom - 24, False)):
+            fade = pygame.Surface((VIEW.width, 24), pygame.SRCALPHA)
+            for y in range(24):
+                a = int(170 * (1 - y / 24)) if top else int(170 * y / 24)
+                pygame.draw.line(fade, (16, 18, 28, a), (0, y), (VIEW.width, y))
+            if (top and self.scroll > 1) or (not top and self.scroll < self.max_scroll - 1):
+                self.screen.blit(fade, (VIEW.left, edge))
+
+        # полоса прокрутки справа от списка
+        if self.max_scroll > 0:
+            track = pygame.Rect(VIEW.right + 10, VIEW.top + 8, 6, VIEW.height - 16)
+            pygame.draw.rect(self.screen, (50, 55, 78), track, border_radius=3)
+            k = VIEW.height / (VIEW.height + self.max_scroll)
+            thumb_h = max(40, int(track.height * k))
+            thumb_y = track.top + (track.height - thumb_h) * (self.scroll / self.max_scroll)
+            dragging = self.press is not None and self.press["kind"] == "drag"
+            pygame.draw.rect(self.screen, ACCENT if dragging else (130, 136, 170),
+                             (track.left, thumb_y, track.width, thumb_h), border_radius=3)
+
+    def _draw_item(self, game, r, active, hold):
+        pygame.draw.rect(self.screen, (8, 9, 14), r.move(0, 5), border_radius=20)
+        pygame.draw.rect(self.screen, TILE_HOVER if active else TILE, r, border_radius=20)
         if active:
-            pygame.draw.rect(self.screen, ACCENT, r, 3, border_radius=22)
+            pygame.draw.rect(self.screen, ACCENT, r, 3, border_radius=20)
 
-        icon = game.icon
-        self.screen.blit(icon, icon.get_rect(midtop=(r.centerx, r.top + 18)))
-        y = r.top + 18 + icon.get_height() + 12
+        self.screen.blit(game.icon, (r.left + 14, r.top + 14))
+        x = r.left + 14 + ICON_SIZE + 22
         name = self.font_name.render(game.name, True, TEXT)
-        self.screen.blit(name, name.get_rect(midtop=(r.centerx, y)))
-        y += 32
-        for line in wrap(game.description, self.font, r.width - 28):
-            txt = self.font.render(line, True, MUTED)
-            self.screen.blit(txt, txt.get_rect(midtop=(r.centerx, y)))
-            y += 21
+        self.screen.blit(name, (x, r.top + 20))
+        y = r.top + 58
+        for line in wrap(game.description, self.font, r.right - x - 24):
+            self.screen.blit(self.font.render(line, True, MUTED), (x, y))
+            y += 22
 
         if game.controls:
             badge = self.font_small.render(game.controls, True, TEXT)
-            box = badge.get_rect(topright=(r.right - 14, r.top + 14)).inflate(16, 8)
+            box = badge.get_rect().inflate(16, 8)
+            box.topright = (r.right - 14, r.top + 14)
             pygame.draw.rect(self.screen, BADGE_COLORS.get(game.controls, (110, 110, 130)), box, border_radius=10)
             self.screen.blit(badge, badge.get_rect(center=box.center))
 
         if hold > 0:
-            bar = pygame.Rect(r.left + 16, r.bottom - 14, int((r.width - 32) * hold), 6)
+            bar = pygame.Rect(x, r.bottom - 16, int((r.right - x - 20) * hold), 6)
             pygame.draw.rect(self.screen, ACCENT, bar, border_radius=3)
+
+    def _draw_cursor(self):
+        x, y = self.cursor
+        color = (255, 80, 80) if self.pinching else (255, 255, 255)
+        pygame.draw.circle(self.screen, (0, 0, 0), (x, y), 15, 5)
+        pygame.draw.circle(self.screen, color, (x, y), 14, 3)
+        p = self.press
+        if p and p["kind"] == "item" and p.get("hold", 0) > 0:
+            rect = pygame.Rect(0, 0, 44, 44)
+            rect.center = (x, y)
+            pygame.draw.arc(self.screen, ACCENT, rect, math.pi / 2, math.pi / 2 + 2 * math.pi * p["hold"], 5)
+        elif p and p["kind"] == "drag":
+            for d in (-1, 1):                                   # стрелки «вверх-вниз» у курсора
+                tip = y + d * 30
+                pygame.draw.polygon(self.screen, ACCENT, [(x, tip), (x - 8, tip - d * 10), (x + 8, tip - d * 10)])
 
     def _banner(self, text, color=TEXT):
         txt = self.font_name.render(text, True, color)
-        box = txt.get_rect(center=(CONTENT_X, 100)).inflate(30, 12)
+        box = txt.get_rect(center=(CONTENT_X, 98)).inflate(30, 12)
         pygame.draw.rect(self.screen, (0, 0, 0), box, border_radius=10)
         self.screen.blit(txt, txt.get_rect(center=box.center))
 

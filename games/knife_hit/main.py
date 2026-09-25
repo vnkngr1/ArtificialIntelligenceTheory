@@ -11,6 +11,7 @@ Knife Hit — Blink Edition
   R       — начать заново
   K       — показать / спрятать окно камеры
   ESC     — выход
+  Средний палец (показать камере и подержать) — выход
 
 Если нож бросается от случайных морганий — увеличьте MIN_CLOSED_TIME:
 тогда засчитываются только нарочно долгие моргания.
@@ -27,6 +28,8 @@ import pygame
 
 from core.blink_tracker import BlinkTracker
 from core.camera_preview import CameraPreview, preview_rect
+from core.display import open_window
+from core.exit_gesture import ExitGesture
 from game import KnifeHitGame
 
 WINDOW_W, WINDOW_H = 560, 760
@@ -54,8 +57,7 @@ def draw_eye_indicator(screen, font, face_detected, score, closed):
 
 def main():
     pygame.init()
-    pygame.display.set_caption("Knife Hit — Blink Edition")
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    screen = open_window((WINDOW_W, WINDOW_H), "Knife Hit — Blink Edition")
     clock = pygame.time.Clock()
     font_small = pygame.font.SysFont("arial", 16)
 
@@ -64,6 +66,7 @@ def main():
     tracker = BlinkTracker(cam_index=0, min_closed_time=MIN_CLOSED_TIME)
     tracker.start()
     preview = CameraPreview(tracker, WINDOW_H)
+    exit_gesture = ExitGesture()
     seen_blinks = 0
 
     running = True
@@ -99,6 +102,9 @@ def main():
         draw_eye_indicator(screen, font_small, face_detected, score, closed)
 
         preview.draw(screen)
+        if exit_gesture.update(dt, tracker):
+            running = False
+        exit_gesture.draw(screen)
         pygame.display.flip()
 
     tracker.stop()

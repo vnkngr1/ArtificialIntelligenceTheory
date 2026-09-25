@@ -36,7 +36,10 @@ import pygame
 
 from core.blink_tracker import BlinkTracker
 from core.camera_preview import CameraPreview, preview_rect
+from core.display import open_window
+from core.exit_gesture import ExitGesture
 from core.gaze_calibration import GazeCalibration
+from core.one_euro import OneEuroFilter
 from game import CARD_W, COL_STEP, COLUMNS, LEFT, SpiderGame, column_x
 
 WINDOW_W, WINDOW_H = 1100, 800
@@ -44,7 +47,8 @@ FPS = 60
 
 LONG_CLOSE = 1.0        # сек закрытых глаз — раздача
 MIN_BLINK = 0.0         # сек; ~0.2 — не реагировать на быстрые непроизвольные моргания
-GAZE_TAU = 0.2          # сглаживание взгляда
+GAZE_MIN_CUTOFF = 0.8   # фильтр One Euro для взгляда: меньше — меньше дрожания в покое
+GAZE_BETA = 2.0         # больше — выбор быстрее реагирует на резкий перевод взгляда
 SWITCH_DWELL = 0.15     # ВЗГЛЯД: столько взгляд должен задержаться на новой колонке
 SWITCH_MARGIN = 0.15    # ВЗГЛЯД: запас (в долях колонки) против дрожания на границе
 STICK_ENTER = 0.3       # ДЖОЙСТИК: отклонение от центра (u), чтобы сдвинуть выбор
@@ -149,8 +153,7 @@ def draw_eye_hud(screen, font, gaze_u, closed_for, face_detected, gaze_mode):
 
 def main():
     pygame.init()
-    pygame.display.set_caption("Паук — Eye Edition")
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    screen = open_window((WINDOW_W, WINDOW_H), "Паук — Eye Edition")
     clock = pygame.time.Clock()
     font_small = pygame.font.SysFont("arial", 16)
     font = pygame.font.SysFont("arial", 20)
@@ -163,12 +166,13 @@ def main():
     tracker = BlinkTracker(cam_index=0)
     tracker.start()
     preview = CameraPreview(tracker, WINDOW_H)
+    exit_gesture = ExitGesture()
     gestures = EyeGestures()
     picker = GazeColumnPicker()
 
     mode = 0
     gaze_mode = "ВЗГЛЯД"
-    smooth_gaze = None
+    gaze_filter = OneEuroFilter(GAZE_MIN_CUTOFF, GAZE_BETA)
 
     running = True
     while running:
@@ -219,7 +223,7 @@ def main():
             gaze = tracker.get_gaze()
             if calibrating:
                 calibration.update(dt, face_detected, gaze)
-                smooth_gaze = None
+                gaze_filter.reset()
             else:
                 gesture = gestures.update(now, face_detected, closed)
                 if gesture == "blink":
@@ -227,9 +231,7 @@ def main():
                 elif gesture == "long":
                     game.deal()
                 if gaze is not None:
-                    alpha = 1 - math.exp(-dt / GAZE_TAU)
-                    smooth_gaze = gaze if smooth_gaze is None else smooth_gaze + (gaze - smooth_gaze) * alpha
-                    gaze_u = calibration.map(smooth_gaze)
+                    gaze_u = gaze_filter(calibration.map(gaze), now)
                     if not closed:          # с закрытыми глазами выбор не двигаем
                         if gaze_mode == "ВЗГЛЯД":
                             game.select(picker.absolute(now, gaze_u, game.selected))
@@ -254,6 +256,9 @@ def main():
         screen.blit(txt, (preview.rect.right + 12, WINDOW_H - 30))
 
         preview.draw(screen)
+        if exit_gesture.update(dt, tracker):
+            running = False
+        exit_gesture.draw(screen)
         pygame.display.flip()
 
     tracker.stop()

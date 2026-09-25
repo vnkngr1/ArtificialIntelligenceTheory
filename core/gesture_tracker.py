@@ -12,6 +12,9 @@ mediapipe.tasks.python.vision.HandLandmarker. Он требует отдельн
     x, y          — нормализованные (0..1) координаты кончика указательного пальца
     pinching      — True, если большой и указательный пальцы сомкнуты ("щипок")
     hand_detected — видна ли рука в кадре вообще
+Курсор сглаживается фильтром One Euro (core/one_euro.py).
+
+exit_gesture() — показан ли жест выхода «средний палец» (см. core/exit_gesture.py).
 
 Дополнительно трекер хранит буфер последних кадров (HandSample) с точным
 временем съёмки — get_samples_since(t). Он нужен играм, которым важна
@@ -34,6 +37,8 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
+from .one_euro import OneEuroFilter2D
+
 # Официальная модель от Google (лёгкая, float16)
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
@@ -46,6 +51,8 @@ WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
 MIDDLE_MCP = 9
+# пары (кончик, средний сустав) для указательного, среднего, безымянного пальцев и мизинца
+FINGERS = {"index": (8, 6), "middle": (12, 10), "ring": (16, 14), "pinky": (20, 18)}
 
 PREVIEW_WIDTH = 320     # ширина кадра для окна камеры в интерфейсе (высота — по пропорциям камеры)
 
@@ -81,6 +88,28 @@ class HandSample:
                               # растёт, когда рука приближается к камере)
 
 
+def middle_finger_up(lm):
+    """Жест «средний палец»: средний выпрямлен, указательный, безымянный и мизинец согнуты.
+
+    Палец выпрямлен, если его кончик заметно дальше от запястья, чем средний
+    сустав, и согнут, если кончик не дальше сустава. Сравниваются расстояния,
+    поэтому поворот руки в кадре не мешает. Большой палец не учитывается."""
+    wrist = lm[WRIST]
+
+    def reach(i):
+        return math.hypot(lm[i].x - wrist.x, lm[i].y - wrist.y)
+
+    def extended(name):
+        tip, pip = FINGERS[name]
+        return reach(tip) > reach(pip) * 1.15
+
+    def folded(name):
+        tip, pip = FINGERS[name]
+        return reach(tip) < reach(pip) * 1.05
+
+    return extended("middle") and folded("index") and folded("ring") and folded("pinky")
+
+
 class PinchHysteresis:
     """Щипок по отношению «расстояние между пальцами / размер руки» с двумя порогами.
 
@@ -105,9 +134,11 @@ class PinchHysteresis:
 
 
 class GestureTracker:
-    def __init__(self, cam_index=0, smoothing=0.5, pinch_threshold=0.055, preview=True):
+    def __init__(self, cam_index=0, pinch_threshold=0.055, preview=True, min_cutoff=0.5, beta=10.0):
+        """min_cutoff / beta — параметры фильтра One Euro для курсора: меньше min_cutoff —
+        меньше дрожания в покое, больше beta — меньше запаздывания при быстром движении."""
         self.cam_index = cam_index
-        self.smoothing = smoothing          # 0..1, чем выше — тем быстрее реакция, но больше дрожания
+        self._filter = OneEuroFilter2D(min_cutoff, beta)
         self.pinch_threshold = pinch_threshold
         self.preview = preview              # готовить кадры для окна камеры в интерфейсе
         self.error = None                   # текст ошибки, если камера или модель недоступны
@@ -123,6 +154,8 @@ class GestureTracker:
 
         self._smooth_x = 0.5
         self._smooth_y = 0.5
+        self._exit_gesture = False
+        self._frames = 0
 
         self._running = False
         self._thread = None
@@ -141,6 +174,16 @@ class GestureTracker:
         """Возвращает (x, y, pinching, hand_detected). x,y в диапазоне 0..1."""
         with self._lock:
             return self._cursor_x, self._cursor_y, self._pinching, self._hand_detected
+
+    def exit_gesture(self):
+        """Показан ли сейчас жест выхода «средний палец»."""
+        with self._lock:
+            return self._exit_gesture
+
+    def camera_ready(self):
+        """Трекер уже обработал хотя бы один кадр камеры."""
+        with self._lock:
+            return self._frames > 0
 
     def get_samples_since(self, t):
         """Возвращает кадры (HandSample), снятые строго позже момента t, по порядку."""
@@ -229,6 +272,7 @@ class GestureTracker:
             raw_x, raw_y = self._smooth_x, self._smooth_y
             sample = HandSample(t=frame_t, detected=False)
             lm = None
+            exit_gesture = False
 
             if result.hand_landmarks:
                 hand_detected = True
@@ -242,6 +286,7 @@ class GestureTracker:
 
                 dist = math.hypot(thumb_tip.x - index_tip.x, thumb_tip.y - index_tip.y)
                 pinching = dist < self.pinch_threshold
+                exit_gesture = middle_finger_up(lm)
 
                 wrist, middle_mcp = lm[WRIST], lm[MIDDLE_MCP]
                 sample = HandSample(
@@ -253,15 +298,16 @@ class GestureTracker:
                     hand_size=math.hypot(wrist.x - middle_mcp.x, wrist.y - middle_mcp.y),
                 )
 
-            # экспоненциальное сглаживание, чтобы курсор не дёргался
-            self._smooth_x += (raw_x - self._smooth_x) * self.smoothing
-            self._smooth_y += (raw_y - self._smooth_y) * self.smoothing
+            # сглаживание One Euro: в покое курсор не дрожит, при быстром движении не отстаёт
+            self._smooth_x, self._smooth_y = self._filter(raw_x, raw_y, frame_t)
 
             with self._lock:
                 self._cursor_x = self._smooth_x
                 self._cursor_y = self._smooth_y
                 self._pinching = pinching
                 self._hand_detected = hand_detected
+                self._exit_gesture = exit_gesture
+                self._frames += 1
                 self._samples.append(sample)
 
             if self.preview:

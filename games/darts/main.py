@@ -19,6 +19,7 @@
   K       — показать / спрятать окно камеры
   R       — начать заново
   ESC     — выход
+  Средний палец (показать камере и подержать) — выход
 """
 
 import os
@@ -34,7 +35,10 @@ import pygame
 
 from game import BOARD_AREA, DartsGame, ThrowMotion
 from core.camera_preview import CameraPreview, hand_status
+from core.display import open_window
+from core.exit_gesture import ExitGesture
 from core.gesture_tracker import GestureTracker, PinchHysteresis
+from core.one_euro import OneEuroFilter2D
 
 WINDOW_W, WINDOW_H = 1100, 760
 FPS = 60
@@ -45,7 +49,8 @@ FPS = 60
 PINCH_CLOSE_RATIO = 0.30
 PINCH_OPEN_RATIO = 0.45
 
-CAM_SMOOTHING = 0.5     # сглаживание курсора для прицеливания (0..1)
+CAM_MIN_CUTOFF = 0.5    # фильтр One Euro для прицела: меньше — меньше дрожания в покое
+CAM_BETA = 10.0         # больше — меньше запаздывания при быстром движении
 CAM_MARGIN = 0.12       # края кадра, до которых рука дотягивается с трудом
 MOTION_WINDOW = 0.18    # за сколько секунд до разжатия меряем скорость броска
 
@@ -72,8 +77,8 @@ class PinchInput:
     и события press / drag / release. Пока пальцы сжаты, пишет траекторию руки,
     по которой потом оценивается скорость броска."""
 
-    def __init__(self, smoothing):
-        self.smoothing = smoothing
+    def __init__(self, smooth=None):
+        self.smooth = smooth           # фильтр One Euro для курсора (None — без сглаживания)
         self.x = self.y = 0.5          # сглаженная позиция, 0..1
         self.pinching = False
         self.detected = False
@@ -82,8 +87,7 @@ class PinchInput:
     def feed(self, t, detected, x, y, size, closed):
         self.detected = detected
         if detected:
-            self.x += (x - self.x) * self.smoothing
-            self.y += (y - self.y) * self.smoothing
+            self.x, self.y = self.smooth(x, y, t) if self.smooth else (x, y)
         closed = closed and detected
 
         event = None
@@ -123,8 +127,7 @@ def dispatch(game, event, pos, hand):
 
 def main():
     pygame.init()
-    pygame.display.set_caption("Дартс — Gesture Edition")
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    screen = open_window((WINDOW_W, WINDOW_H), "Дартс — Gesture Edition")
     clock = pygame.time.Clock()
     font_small = pygame.font.SysFont("arial", 18)
 
@@ -133,10 +136,11 @@ def main():
     tracker = GestureTracker(cam_index=0)
     tracker.start()
     preview = CameraPreview(tracker, WINDOW_H)
+    exit_gesture = ExitGesture()
     text_x = preview.rect.right + 12
 
-    cam_input = PinchInput(CAM_SMOOTHING)
-    mouse_input = PinchInput(1.0)
+    cam_input = PinchInput(OneEuroFilter2D(CAM_MIN_CUTOFF, CAM_BETA))
+    mouse_input = PinchInput()
     pinch = PinchHysteresis(PINCH_CLOSE_RATIO, PINCH_OPEN_RATIO)
     last_sample_t = 0.0
 
@@ -188,6 +192,9 @@ def main():
             screen.blit(warn, (text_x, WINDOW_H - 48))
 
         preview.draw(screen, hand_status(cam_input.detected, cam_input.pinching))
+        if exit_gesture.update(dt, tracker):
+            running = False
+        exit_gesture.draw(screen)
         pygame.display.flip()
 
     tracker.stop()

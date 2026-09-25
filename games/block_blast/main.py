@@ -10,6 +10,7 @@ Block Blast — Gesture Edition
   R       — начать заново
   K       — показать / спрятать окно камеры
   ESC     — выход
+  Средний палец (показать камере и подержать) — выход
   Щипок (большой + указательный палец) — "зажать" блок и тащить,
             разжатие пальцев — отпустить блок на поле.
 """
@@ -25,6 +26,8 @@ import pygame
 
 from game import BlockBlastGame
 from core.camera_preview import CameraPreview, preview_rect
+from core.display import open_window
+from core.exit_gesture import ExitGesture
 from core.gesture_tracker import GestureTracker
 
 WINDOW_W, WINDOW_H = 760, 760
@@ -33,8 +36,7 @@ FPS = 60
 
 def main():
     pygame.init()
-    pygame.display.set_caption("Block Blast — Gesture Edition")
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    screen = open_window((WINDOW_W, WINDOW_H), "Block Blast — Gesture Edition")
     clock = pygame.time.Clock()
     font_small = pygame.font.SysFont("arial", 18)
 
@@ -43,6 +45,7 @@ def main():
     tracker = GestureTracker(cam_index=0)
     tracker.start()
     preview = CameraPreview(tracker, WINDOW_H)
+    exit_gesture = ExitGesture()
     text_x = preview.rect.right + 12
 
     use_gesture = True
@@ -50,6 +53,7 @@ def main():
     hand_detected = True
 
     running = True
+    dt = 0.0
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -94,8 +98,11 @@ def main():
         pygame.draw.circle(screen, (255, 0, 0) if is_down else (20, 20, 20), (cursor_x, cursor_y), 8, 2)
 
         preview.draw(screen)
+        if exit_gesture.update(dt, tracker):
+            running = False
+        exit_gesture.draw(screen)
         pygame.display.flip()
-        clock.tick(FPS)
+        dt = clock.tick(FPS) / 1000.0
 
     tracker.stop()
     pygame.quit()

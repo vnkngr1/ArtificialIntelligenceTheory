@@ -18,6 +18,7 @@
   K   — показать / спрятать окно камеры
   R   — начать уровень заново
   ESC — выход
+  Средний палец (показать камере и подержать) — выход
 """
 
 import os
@@ -30,13 +31,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import pygame
 
 from core.camera_preview import CameraPreview, hand_status, preview_rect
+from core.display import open_window
+from core.exit_gesture import ExitGesture
 from core.gesture_tracker import GestureTracker, PinchHysteresis
+from core.one_euro import OneEuroFilter2D
 from game import SplinterGame
 
 WINDOW_W, WINDOW_H = 1000, 720
 FPS = 60
 
-CAM_SMOOTHING = 0.5     # сглаживание кончика пинцета (0..1, меньше — плавнее)
+CAM_MIN_CUTOFF = 0.5    # фильтр One Euro для пинцета: меньше — меньше дрожания в покое
+CAM_BETA = 10.0         # больше — меньше запаздывания при быстром движении
 CAM_MARGIN = 0.15       # края кадра, до которых рука дотягивается с трудом
 
 
@@ -48,8 +53,7 @@ def cam_to_screen(x, y):
 
 def main():
     pygame.init()
-    pygame.display.set_caption("Занозы — Gesture Edition")
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    screen = open_window((WINDOW_W, WINDOW_H), "Занозы — Gesture Edition")
     clock = pygame.time.Clock()
     font_small = pygame.font.SysFont("arial", 16)
 
@@ -58,9 +62,11 @@ def main():
     tracker = GestureTracker(cam_index=0)
     tracker.start()
     preview = CameraPreview(tracker, WINDOW_H)
+    exit_gesture = ExitGesture()
     pinch = PinchHysteresis()
     last_sample_t = 0.0
     sx = sy = 0.5
+    tip_filter = OneEuroFilter2D(CAM_MIN_CUTOFF, CAM_BETA)
     pinching = False
     hand_detected = False
 
@@ -94,8 +100,7 @@ def main():
                 last_sample_t = sample.t
                 hand_detected = sample.detected
                 if sample.detected:
-                    sx += (sample.x - sx) * CAM_SMOOTHING
-                    sy += (sample.y - sy) * CAM_SMOOTHING
+                    sx, sy = tip_filter(sample.x, sample.y, sample.t)
                 closed = pinch.update(sample)
                 pos = cam_to_screen(sx, sy)
                 if closed and not pinching:
@@ -131,6 +136,9 @@ def main():
             screen.blit(warn, (preview.rect.right + 12, WINDOW_H - 58))
 
         preview.draw(screen, hand_status(hand_detected, pinching) if use_gesture else None)
+        if exit_gesture.update(dt, tracker):
+            running = False
+        exit_gesture.draw(screen)
         pygame.display.flip()
 
     tracker.stop()

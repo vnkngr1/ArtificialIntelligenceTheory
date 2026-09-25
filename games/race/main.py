@@ -18,9 +18,9 @@
   K   — показать / спрятать окно камеры
   R   — начать заново
   ESC — выход
+  Средний палец (показать камере и подержать) — выход
 """
 
-import math
 import os
 import sys
 import time
@@ -33,13 +33,17 @@ import pygame
 
 from core.blink_tracker import BlinkTracker
 from core.camera_preview import CameraPreview
+from core.display import open_window
+from core.exit_gesture import ExitGesture
 from core.gaze_calibration import GazeCalibration
+from core.one_euro import OneEuroFilter
 from game import LANE_CENTERS, RaceGame
 
 WINDOW_W, WINDOW_H = 900, 760
 FPS = 60
 
-GAZE_TAU = 0.15         # сек, сглаживание взгляда (больше — плавнее, но с запаздыванием)
+GAZE_MIN_CUTOFF = 1.0   # фильтр One Euro для взгляда: меньше — меньше дрожания в покое
+GAZE_BETA = 2.0         # больше — машина быстрее реагирует на резкий перевод взгляда
 GAZE_GAIN = 1.0         # >1 — хватает меньшего движения глаз, чтобы доехать до края
 FACE_LOST_PAUSE = 0.4   # сек без лица — пауза
 
@@ -48,8 +52,7 @@ MODES = ["ГЛАЗА", "МЫШЬ", "КЛАВИШИ"]
 
 def main():
     pygame.init()
-    pygame.display.set_caption("Гонка в потоке — Eye Edition")
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    screen = open_window((WINDOW_W, WINDOW_H), "Гонка в потоке — Eye Edition")
     clock = pygame.time.Clock()
     font_small = pygame.font.SysFont("arial", 16)
     font = pygame.font.SysFont("arial", 20)
@@ -61,10 +64,11 @@ def main():
     tracker = BlinkTracker(cam_index=0)
     tracker.start()
     preview = CameraPreview(tracker, WINDOW_H)
+    exit_gesture = ExitGesture()
     seen_blinks = 0
 
     mode = 0
-    smooth_gaze = None
+    gaze_filter = OneEuroFilter(GAZE_MIN_CUTOFF, GAZE_BETA)
     key_u = 2 / 3
     last_face_t = time.time()
 
@@ -104,11 +108,9 @@ def main():
         if MODES[mode] == "ГЛАЗА":
             if calibrating:
                 calibration.update(dt, face_detected, gaze)
-                smooth_gaze = None
+                gaze_filter.reset()
             elif gaze is not None:
-                alpha = 1 - math.exp(-dt / GAZE_TAU)
-                smooth_gaze = gaze if smooth_gaze is None else smooth_gaze + (gaze - smooth_gaze) * alpha
-                game.set_target(calibration.map(smooth_gaze))
+                game.set_target(gaze_filter(calibration.map(gaze), time.time()))
             game.paused = calibrating or time.time() - last_face_t > FACE_LOST_PAUSE
         elif MODES[mode] == "МЫШЬ":
             mx = pygame.mouse.get_pos()[0]
@@ -134,6 +136,9 @@ def main():
         screen.blit(txt, (WINDOW_W - txt.get_width() - 12, WINDOW_H - 44))
 
         preview.draw(screen)
+        if exit_gesture.update(dt, tracker):
+            running = False
+        exit_gesture.draw(screen)
         pygame.display.flip()
 
     tracker.stop()
