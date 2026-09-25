@@ -1,3 +1,3 @@
-# ArtificialIntelligenceTheory
+# Artificial Intelligence Theory
 Гаршин Иван. Ершов Арсений. Ридигер Валентин. ИУ1-52Б. Итоговый проект. Теория искусственного интеллекта
 
