@@ -20,13 +20,13 @@
 """
 
 import math
-import statistics
 import sys
 import time
 
 import pygame
 
 from blink_tracker import BlinkTracker
+from gaze_calibration import GazeCalibration
 from race_game import LANE_CENTERS, RaceGame
 
 WINDOW_W, WINDOW_H = 900, 760
@@ -39,96 +39,6 @@ FACE_LOST_PAUSE = 0.4   # сек без лица — пауза
 MODES = ["ГЛАЗА", "МЫШЬ", "КЛАВИШИ"]
 
 
-class GazeCalibration:
-    """Три точки: центр, левая полоса, правая полоса. На каждой — пауза, чтобы
-    перевести взгляд, затем сбор значений и медиана (она устойчива к выбросам)."""
-
-    POINTS = [0.5, 0.0, 1.0]   # u: 0 — центр левой полосы, 1 — центр правой
-    SETTLE = 0.8
-    COLLECT = 1.2
-    MIN_SPAN = 0.015            # слишком маленький разброс лево-право — калибровка не удалась
-
-    def __init__(self, font, font_big):
-        self.font = font
-        self.font_big = font_big
-        self.values = None
-        self.message = None
-        self.restart()
-
-    def restart(self):
-        self.index = 0
-        self.t = 0.0
-        self.samples = []
-        self.collected = []
-        self.done = False
-
-    def update(self, dt, face_detected, gaze):
-        if self.done or not face_detected:
-            return
-        self.t += dt
-        if self.t > self.SETTLE and gaze is not None:
-            self.samples.append(gaze)
-        if self.t >= self.SETTLE + self.COLLECT and len(self.samples) >= 8:
-            self.collected.append(statistics.median(self.samples))
-            self.index += 1
-            self.t, self.samples = 0.0, []
-            if self.index == len(self.POINTS):
-                self._finish()
-
-    def _finish(self):
-        c, left, right = self.collected
-        if (left - c) * (right - c) < 0 and abs(right - left) >= self.MIN_SPAN \
-                and min(abs(left - c), abs(right - c)) > 0.003:
-            self.values = (c, left, right)
-            self.message = None
-            self.done = True
-        else:
-            self.message = "Не получилось различить взгляд влево и вправо — повторим. Держите голову неподвижно."
-            self.restart()
-
-    def map(self, gaze):
-        """Значение зрачков → u (0 — левая полоса, 1 — правая), кусочно-линейно через центр."""
-        c, left, right = self.values
-        if (gaze - c) * (left - c) > 0:
-            u = 0.5 - 0.5 * (gaze - c) / (left - c)
-        else:
-            u = 0.5 + 0.5 * (gaze - c) / (right - c)
-        return 0.5 + (u - 0.5) * GAZE_GAIN
-
-    def draw(self, screen, face_detected):
-        overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 150))
-        screen.blit(overlay, (0, 0))
-        w = screen.get_width()
-
-        def center_text(text, font, y, color=(245, 245, 245)):
-            txt = font.render(text, True, color)
-            screen.blit(txt, txt.get_rect(center=(w // 2, y)))
-
-        center_text("Калибровка взгляда", self.font_big, 110)
-        center_text("Смотрите на жёлтую точку, голову держите неподвижно", self.font, 160)
-        if self.message:
-            center_text(self.message, self.font, 200, (255, 120, 120))
-        if not face_detected:
-            center_text("Лицо не найдено в кадре камеры", self.font, 600, (255, 120, 120))
-
-        u = self.POINTS[self.index]
-        x = LANE_CENTERS[0] + u * (LANE_CENTERS[-1] - LANE_CENTERS[0])
-        y = WINDOW_H // 2
-        for i, pu in enumerate(self.POINTS):
-            px = LANE_CENTERS[0] + pu * (LANE_CENTERS[-1] - LANE_CENTERS[0])
-            if i < self.index:
-                pygame.draw.circle(screen, (90, 200, 110), (px, y), 8)
-        pygame.draw.circle(screen, (255, 220, 60), (x, y), 14)
-        pygame.draw.circle(screen, (20, 20, 20), (x, y), 4)
-        progress = max(0.0, min(1.0, (self.t - self.SETTLE) / self.COLLECT))
-        if progress > 0:
-            rect = pygame.Rect(0, 0, 50, 50)
-            rect.center = (x, y)
-            pygame.draw.arc(screen, (255, 220, 60), rect, math.pi / 2, math.pi / 2 + 2 * math.pi * progress, 4)
-        center_text(f"Точка {self.index + 1} из {len(self.POINTS)}", self.font, y + 60)
-
-
 def main():
     pygame.init()
     pygame.display.set_caption("Гонка в потоке — Eye Edition")
@@ -139,7 +49,7 @@ def main():
     font_big = pygame.font.SysFont("arial", 40, bold=True)
 
     game = RaceGame(screen, WINDOW_W, WINDOW_H)
-    calibration = GazeCalibration(font, font_big)
+    calibration = GazeCalibration(font, font_big, LANE_CENTERS[0], LANE_CENTERS[-1], WINDOW_H // 2, GAZE_GAIN)
 
     tracker = BlinkTracker(cam_index=0, show_debug=True)
     tracker.start()

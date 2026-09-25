@@ -173,7 +173,11 @@ class BlinkTracker:
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = landmarker.detect_for_video(mp_image, int((frame_t - start_time) * 1000))
+            try:
+                result = landmarker.detect_for_video(mp_image, int((frame_t - start_time) * 1000))
+            except RuntimeError:
+                # интерпретатор уже завершается (игра упала или закрылась без stop())
+                break
 
             face_detected = bool(result.face_blendshapes)
             with self._lock:

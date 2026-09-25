@@ -155,7 +155,11 @@ class GestureTracker:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
             timestamp_ms = int((time.time() - start_time) * 1000)
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            try:
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            except RuntimeError:
+                # интерпретатор уже завершается (игра упала или закрылась без stop())
+                break
 
             hand_detected = False
             pinching = False
