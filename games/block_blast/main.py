@@ -8,17 +8,24 @@ Block Blast — Gesture Edition
 Управление:
   G       — переключить режим ЖЕСТЫ / МЫШЬ (для отладки без камеры)
   R       — начать заново
+  K       — показать / спрятать окно камеры
   ESC     — выход
   Щипок (большой + указательный палец) — "зажать" блок и тащить,
             разжатие пальцев — отпустить блок на поле.
 """
 
+import os
 import sys
+
+# Корень проекта — в sys.path, чтобы найти общий пакет core/ (и при запуске
+# через launcher.py, и при запуске этого файла напрямую, например из PyCharm).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pygame
 
 from game import BlockBlastGame
-from gesture_tracker import GestureTracker
+from core.camera_preview import CameraPreview, preview_rect
+from core.gesture_tracker import GestureTracker
 
 WINDOW_W, WINDOW_H = 760, 760
 FPS = 60
@@ -31,10 +38,12 @@ def main():
     clock = pygame.time.Clock()
     font_small = pygame.font.SysFont("arial", 18)
 
-    game = BlockBlastGame(screen, WINDOW_W, WINDOW_H)
+    game = BlockBlastGame(screen, WINDOW_W, WINDOW_H, reserved=preview_rect(WINDOW_H))
 
-    tracker = GestureTracker(cam_index=0, show_debug=True)
+    tracker = GestureTracker(cam_index=0)
     tracker.start()
+    preview = CameraPreview(tracker, WINDOW_H)
+    text_x = preview.rect.right + 12
 
     use_gesture = True
     prev_down = False
@@ -50,6 +59,8 @@ def main():
                     running = False
                 elif event.key == pygame.K_g:
                     use_gesture = not use_gesture
+                elif event.key == pygame.K_k:
+                    preview.toggle()
                 elif event.key == pygame.K_r:
                     game.reset()
 
@@ -73,15 +84,16 @@ def main():
         game.update()
         game.draw((cursor_x, cursor_y))
 
-        mode_txt = f"Режим: {'ЖЕСТЫ' if use_gesture else 'МЫШЬ'}  (G — переключить, R — заново, ESC — выход)"
-        screen.blit(font_small.render(mode_txt, True, (90, 90, 90)), (10, WINDOW_H - 26))
+        mode_txt = f"Режим: {'ЖЕСТЫ' if use_gesture else 'МЫШЬ'}  (G — сменить, R — заново, K — камера, ESC — выход)"
+        screen.blit(font_small.render(mode_txt, True, (90, 90, 90)), (text_x, WINDOW_H - 26))
 
         if use_gesture and not hand_detected:
             warn = font_small.render("Рука не найдена в кадре камеры", True, (200, 30, 30))
-            screen.blit(warn, (10, WINDOW_H - 46))
+            screen.blit(warn, (text_x, WINDOW_H - 46))
 
         pygame.draw.circle(screen, (255, 0, 0) if is_down else (20, 20, 20), (cursor_x, cursor_y), 8, 2)
 
+        preview.draw(screen)
         pygame.display.flip()
         clock.tick(FPS)
 

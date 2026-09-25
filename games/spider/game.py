@@ -70,10 +70,12 @@ def column_x(i):
 
 
 class SpiderGame:
-    def __init__(self, screen, width, height):
+    def __init__(self, screen, width, height, reserved=None):
+        """reserved — занятая область окна (окно камеры): колонки над ней сжимаются, чтобы её не закрывать."""
         self.screen = screen
         self.width = width
         self.height = height
+        self.reserved = reserved
 
         self.font_small = pygame.font.SysFont("arial", 16)
         self.font = pygame.font.SysFont("arial", 22, bold=True)
@@ -260,7 +262,10 @@ class SpiderGame:
         cards = self.columns[col]
         downs = sum(1 for c in cards[:-1] if not c.face_up)
         ups = max(0, len(cards) - 1 - downs)
-        room = self.height - 72 - TABLE_TOP - CARD_H
+        bottom = self.height - 72
+        if self.reserved and column_x(col) < self.reserved.right:
+            bottom = self.reserved.top - 12
+        room = bottom - TABLE_TOP - CARD_H
         need = downs * GAP_DOWN + ups * GAP_UP
         k = min(1.0, room / need) if need else 1.0
         return GAP_DOWN * k, GAP_UP * k

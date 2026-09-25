@@ -16,6 +16,9 @@ mediapipe.tasks.python.vision.HandLandmarker. Он требует отдельн
 Дополнительно трекер хранит буфер последних кадров (HandSample) с точным
 временем съёмки — get_samples_since(t). Он нужен играм, которым важна
 скорость движения руки (например, бросок в дартсе).
+
+Для окна камеры в интерфейсе игры (core/camera_preview.py) трекер готовит
+уменьшенный кадр с нарисованной рукой — get_preview().
 """
 
 import math
@@ -43,6 +46,8 @@ WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
 MIDDLE_MCP = 9
+
+PREVIEW_WIDTH = 320     # ширина кадра для окна камеры в интерфейсе (высота — по пропорциям камеры)
 
 # Пары точек для отрисовки скелета руки в отладочном окне
 # (тот же набор связей, что был в mp.solutions.hands.HAND_CONNECTIONS)
@@ -76,12 +81,36 @@ class HandSample:
                               # растёт, когда рука приближается к камере)
 
 
+class PinchHysteresis:
+    """Щипок по отношению «расстояние между пальцами / размер руки» с двумя порогами.
+
+    В отличие от абсолютного порога pinch_threshold, отношение не меняется,
+    когда рука приближается к камере или отдаляется от неё, а гистерезис
+    (сжать — ниже close_ratio, разжать — выше open_ratio) не даёт щипку
+    «мигать» на границе."""
+
+    def __init__(self, close_ratio=0.30, open_ratio=0.45):
+        self.close_ratio = close_ratio
+        self.open_ratio = open_ratio
+        self.closed = False
+
+    def update(self, sample):
+        """sample — HandSample; возвращает, сжаты ли пальцы."""
+        if not sample.detected or sample.hand_size < 1e-6:
+            self.closed = False
+        else:
+            ratio = sample.pinch_dist / sample.hand_size
+            self.closed = ratio < (self.open_ratio if self.closed else self.close_ratio)
+        return self.closed
+
+
 class GestureTracker:
-    def __init__(self, cam_index=0, smoothing=0.5, pinch_threshold=0.055, show_debug=True):
+    def __init__(self, cam_index=0, smoothing=0.5, pinch_threshold=0.055, preview=True):
         self.cam_index = cam_index
         self.smoothing = smoothing          # 0..1, чем выше — тем быстрее реакция, но больше дрожания
         self.pinch_threshold = pinch_threshold
-        self.show_debug = show_debug
+        self.preview = preview              # готовить кадры для окна камеры в интерфейсе
+        self.error = None                   # текст ошибки, если камера или модель недоступны
 
         self._lock = threading.Lock()
         self._cursor_x = 0.5
@@ -89,6 +118,8 @@ class GestureTracker:
         self._pinching = False
         self._hand_detected = False
         self._samples = deque(maxlen=120)  # ~4 секунды истории при 30 FPS
+        self._preview = None
+        self._preview_id = 0
 
         self._smooth_x = 0.5
         self._smooth_y = 0.5
@@ -116,12 +147,43 @@ class GestureTracker:
         with self._lock:
             return [s for s in self._samples if s.t > t]
 
+    def get_preview(self):
+        """(номер кадра, RGB-кадр numpy HxWx3 с нарисованной рукой); (0, None), пока кадров нет."""
+        with self._lock:
+            return self._preview_id, self._preview
+
+    def preview_status(self):
+        """Подпись для окна камеры: (текст, цвет RGB)."""
+        with self._lock:
+            if self._pinching:
+                return "ЩИПОК", (90, 230, 120)
+            return ("РУКА", (90, 200, 255)) if self._hand_detected else ("НЕТ РУКИ", (255, 110, 110))
+
+    def _store_preview(self, frame, lm):
+        """Уменьшает кадр и рисует на нём скелет руки — для окна камеры в интерфейсе."""
+        h, w = frame.shape[:2]
+        pw, ph = PREVIEW_WIDTH, int(PREVIEW_WIDTH * h / w)
+        small = cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA)
+        if lm is not None:
+            pts = [(int(p.x * pw), int(p.y * ph)) for p in lm]
+            for a, b in HAND_CONNECTIONS:
+                cv2.line(small, pts[a], pts[b], (0, 200, 0), 2, cv2.LINE_AA)
+            for p in pts:
+                cv2.circle(small, p, 3, (0, 120, 255), -1, cv2.LINE_AA)
+            for i in (THUMB_TIP, INDEX_TIP):
+                cv2.circle(small, pts[i], 5, (255, 255, 255), 2, cv2.LINE_AA)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        with self._lock:
+            self._preview = rgb
+            self._preview_id += 1
+
     def _run(self):
         try:
             ensure_model()
         except Exception as exc:
             print("[GestureTracker] Не удалось скачать модель:", exc)
             print("[GestureTracker] Проверьте интернет-соединение и повторите запуск.")
+            self.error = "Нет модели руки (нужен интернет)"
             self._running = False
             return
 
@@ -139,6 +201,7 @@ class GestureTracker:
         cap = cv2.VideoCapture(self.cam_index)
         if not cap.isOpened():
             print("[GestureTracker] Не удалось открыть камеру индекс", self.cam_index)
+            self.error = "Камера недоступна"
             self._running = False
             return
 
@@ -165,6 +228,7 @@ class GestureTracker:
             pinching = False
             raw_x, raw_y = self._smooth_x, self._smooth_y
             sample = HandSample(t=frame_t, detected=False)
+            lm = None
 
             if result.hand_landmarks:
                 hand_detected = True
@@ -189,14 +253,6 @@ class GestureTracker:
                     hand_size=math.hypot(wrist.x - middle_mcp.x, wrist.y - middle_mcp.y),
                 )
 
-                if self.show_debug:
-                    h, w, _ = frame.shape
-                    pts = [(int(p.x * w), int(p.y * h)) for p in lm]
-                    for a, b in HAND_CONNECTIONS:
-                        cv2.line(frame, pts[a], pts[b], (0, 200, 0), 2)
-                    for p in pts:
-                        cv2.circle(frame, p, 4, (0, 120, 255), -1)
-
             # экспоненциальное сглаживание, чтобы курсор не дёргался
             self._smooth_x += (raw_x - self._smooth_x) * self.smoothing
             self._smooth_y += (raw_y - self._smooth_y) * self.smoothing
@@ -208,14 +264,8 @@ class GestureTracker:
                 self._hand_detected = hand_detected
                 self._samples.append(sample)
 
-            if self.show_debug:
-                status = "PINCH" if pinching else ("HAND" if hand_detected else "NO HAND")
-                color = (0, 255, 0) if pinching else (0, 200, 255) if hand_detected else (0, 0, 255)
-                cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                cv2.imshow("Gesture debug (закроется вместе с игрой)", frame)
-                cv2.waitKey(1)
+            if self.preview:
+                self._store_preview(frame, lm)
 
         landmarker.close()
         cap.release()
-        if self.show_debug:
-            cv2.destroyAllWindows()

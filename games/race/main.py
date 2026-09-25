@@ -15,19 +15,26 @@
   Моргание / ПРОБЕЛ     — начать заново после аварии
   G   — режим ГЛАЗА → МЫШЬ → КЛАВИШИ (стрелки ← →), для отладки без камеры
   C   — перекалибровать взгляд
+  K   — показать / спрятать окно камеры
   R   — начать заново
   ESC — выход
 """
 
 import math
+import os
 import sys
 import time
 
+# Корень проекта — в sys.path, чтобы найти общий пакет core/ (и при запуске
+# через launcher.py, и при запуске этого файла напрямую, например из PyCharm).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import pygame
 
-from blink_tracker import BlinkTracker
-from gaze_calibration import GazeCalibration
-from race_game import LANE_CENTERS, RaceGame
+from core.blink_tracker import BlinkTracker
+from core.camera_preview import CameraPreview
+from core.gaze_calibration import GazeCalibration
+from game import LANE_CENTERS, RaceGame
 
 WINDOW_W, WINDOW_H = 900, 760
 FPS = 60
@@ -51,8 +58,9 @@ def main():
     game = RaceGame(screen, WINDOW_W, WINDOW_H)
     calibration = GazeCalibration(font, font_big, LANE_CENTERS[0], LANE_CENTERS[-1], WINDOW_H // 2, GAZE_GAIN)
 
-    tracker = BlinkTracker(cam_index=0, show_debug=True)
+    tracker = BlinkTracker(cam_index=0)
     tracker.start()
+    preview = CameraPreview(tracker, WINDOW_H)
     seen_blinks = 0
 
     mode = 0
@@ -75,6 +83,8 @@ def main():
                 elif event.key == pygame.K_c:
                     calibration.restart()
                     mode = 0
+                elif event.key == pygame.K_k:
+                    preview.toggle()
                 elif event.key == pygame.K_r:
                     game.reset()
                 elif event.key == pygame.K_SPACE:
@@ -119,10 +129,11 @@ def main():
             warn = font.render("Лицо не найдено в кадре камеры — пауза", True, (255, 120, 120))
             screen.blit(warn, warn.get_rect(center=(WINDOW_W // 2, 80)))
 
-        mode_txt = f"Режим: {MODES[mode]}  (G — сменить, C — калибровка, R — заново, ESC — выход)"
+        mode_txt = f"Режим: {MODES[mode]}  (G — сменить, C — калибровка, R — заново, K — камера, ESC — выход)"
         txt = font_small.render(mode_txt, True, (235, 235, 235))
         screen.blit(txt, (WINDOW_W - txt.get_width() - 12, WINDOW_H - 44))
 
+        preview.draw(screen)
         pygame.display.flip()
 
     tracker.stop()

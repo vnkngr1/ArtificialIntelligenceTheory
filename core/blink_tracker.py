@@ -12,6 +12,9 @@ FaceLandmarker кроме 478 точек лица умеет выдавать «
 пока глаза открыты. Плюс гистерезис: закрыть — выше одного порога,
 открыть — ниже другого, чтобы одно моргание не считалось дважды.
 
+Для окна камеры в интерфейсе игры (core/camera_preview.py) трекер готовит
+кадр, обрезанный вокруг лица, с отмеченными глазами и зрачками — get_preview().
+
 Работает в отдельном потоке, как и GestureTracker. Наружу отдаёт get_state():
     face_detected — видно ли лицо
     closed_score  — насколько закрыты глаза, 0..1
@@ -36,7 +39,7 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
-from gesture_tracker import ensure_model
+from .gesture_tracker import ensure_model
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
@@ -49,6 +52,8 @@ EYE_POINTS = [33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380]
 
 EYE_CORNERS = [(33, 133), (362, 263)]   # уголки правого и левого глаза
 IRIS_CENTERS = [468, 473]
+
+PREVIEW_SIZE = (320, 240)   # кадр для окна камеры в интерфейсе (4:3, обрезан вокруг лица)
 
 
 def gaze_ratio(lm):
@@ -69,20 +74,22 @@ def gaze_ratio(lm):
 
 class BlinkTracker:
     def __init__(self, cam_index=0, close_threshold=0.5, open_threshold=0.35,
-                 min_closed_time=0.0, show_debug=True):
+                 min_closed_time=0.0, preview=True):
         """
         close_threshold — глаза считаются закрытыми выше этого значения
                           (не ниже «открытого» уровня + 0.25);
         open_threshold  — и снова открытыми ниже этого значения;
         min_closed_time — сколько секунд глаза должны быть закрыты, чтобы
                           засчитать моргание. 0 — мгновенно. ~0.25 — только
-                          нарочно долгое моргание, случайные не срабатывают.
+                          нарочно долгое моргание, случайные не срабатывают;
+        preview         — готовить кадры для окна камеры в интерфейсе.
         """
         self.cam_index = cam_index
         self.close_threshold = close_threshold
         self.open_threshold = open_threshold
         self.min_closed_time = min_closed_time
-        self.show_debug = show_debug
+        self.preview = preview
+        self.error = None            # текст ошибки, если камера или модель недоступны
 
         self._lock = threading.Lock()
         self._face_detected = False
@@ -90,6 +97,9 @@ class BlinkTracker:
         self._closed = False
         self._blink_count = 0
         self._gaze = None
+        self._preview = None
+        self._preview_id = 0
+        self._crop = None            # сглаженная рамка обрезки вокруг лица: (cx, cy, ширина)
 
         self._open_level = 0.1       # типичное значение при открытых глазах
         self._closed_since = None
@@ -120,6 +130,55 @@ class BlinkTracker:
         with self._lock:
             return self._gaze if self._face_detected else None
 
+    def get_preview(self):
+        """(номер кадра, RGB-кадр numpy HxWx3 вокруг лица); (0, None), пока кадров нет."""
+        with self._lock:
+            return self._preview_id, self._preview
+
+    def preview_status(self):
+        """Подпись для окна камеры: (текст, цвет RGB)."""
+        with self._lock:
+            if not self._face_detected:
+                return "НЕТ ЛИЦА", (255, 110, 110)
+            return ("ГЛАЗА ЗАКРЫТЫ", (255, 200, 90)) if self._closed else ("ГЛАЗА ОТКРЫТЫ", (90, 230, 120))
+
+    def _store_preview(self, frame, lm):
+        """Кадр для интерфейса: обрезка вокруг лица (чтобы глаза были крупнее) + точки глаз."""
+        h, w = frame.shape[:2]
+        if lm is not None:
+            xs, ys = [p.x for p in lm], [p.y for p in lm]
+            target = ((min(xs) + max(xs)) / 2 * w, (min(ys) + max(ys)) / 2 * h,
+                      max((max(xs) - min(xs)) * w, (max(ys) - min(ys)) * h * 4 / 3) * 1.5)
+        else:
+            target = (w / 2, h / 2, w)                  # лица нет — показываем весь кадр
+        if self._crop is None:
+            self._crop = target
+        else:                                           # плавно, чтобы картинка не дёргалась
+            self._crop = tuple(c + (t - c) * 0.25 for c, t in zip(self._crop, target))
+        cx, cy, cw = self._crop
+        cw = max(40.0, min(cw, w, h * 4 / 3))
+        ch = cw * 3 / 4
+        x0 = min(max(cx - cw / 2, 0), w - cw)
+        y0 = min(max(cy - ch / 2, 0), h - ch)
+        crop = frame[int(y0):int(y0 + ch), int(x0):int(x0 + cw)]
+        pw, ph = PREVIEW_SIZE
+        small = cv2.resize(crop, (pw, ph), interpolation=cv2.INTER_AREA)
+        if lm is not None:
+            k = pw / cw
+
+            def to_px(p):
+                return int((p.x * w - x0) * k), int((p.y * h - y0) * k)
+
+            for i in EYE_POINTS:
+                cv2.circle(small, to_px(lm[i]), 2, (0, 200, 255), -1, cv2.LINE_AA)
+            if len(lm) > max(IRIS_CENTERS):
+                for i in IRIS_CENTERS:
+                    cv2.circle(small, to_px(lm[i]), 4, (255, 0, 255), -1, cv2.LINE_AA)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        with self._lock:
+            self._preview = rgb
+            self._preview_id += 1
+
     def _update_blink(self, score, t):
         close_at = max(self.close_threshold, self._open_level + 0.25)
         if not self._closed:
@@ -142,6 +201,7 @@ class BlinkTracker:
         except Exception as exc:
             print("[BlinkTracker] Не удалось скачать модель:", exc)
             print("[BlinkTracker] Проверьте интернет-соединение и повторите запуск.")
+            self.error = "Нет модели лица (нужен интернет)"
             self._running = False
             return
 
@@ -159,6 +219,7 @@ class BlinkTracker:
         cap = cv2.VideoCapture(self.cam_index)
         if not cap.isOpened():
             print("[BlinkTracker] Не удалось открыть камеру индекс", self.cam_index)
+            self.error = "Камера недоступна"
             self._running = False
             return
 
@@ -191,29 +252,9 @@ class BlinkTracker:
                         self._gaze = gaze
                 else:
                     self._closed = False
-                score, closed, count, gaze = self._score, self._closed, self._blink_count, self._gaze
 
-            if self.show_debug:
-                h, w, _ = frame.shape
-                if result.face_landmarks:
-                    lm = result.face_landmarks[0]
-                    for i in EYE_POINTS:
-                        cv2.circle(frame, (int(lm[i].x * w), int(lm[i].y * h)), 2, (0, 200, 255), -1)
-                    if len(lm) > max(IRIS_CENTERS):
-                        for i in IRIS_CENTERS:
-                            cv2.circle(frame, (int(lm[i].x * w), int(lm[i].y * h)), 3, (255, 0, 255), -1)
-                if face_detected:
-                    status = f"{'CLOSED' if closed else 'OPEN'}  {score:.2f}  blinks: {count}"
-                    if gaze is not None:
-                        status += f"  gaze: {gaze:.3f}"
-                    color = (0, 0, 255) if closed else (0, 220, 0)
-                else:
-                    status, color = "NO FACE", (0, 0, 255)
-                cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                cv2.imshow("Blink debug (закроется вместе с игрой)", frame)
-                cv2.waitKey(1)
+            if self.preview:
+                self._store_preview(frame, result.face_landmarks[0] if result.face_landmarks else None)
 
         landmarker.close()
         cap.release()
-        if self.show_debug:
-            cv2.destroyAllWindows()

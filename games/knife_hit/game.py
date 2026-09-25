@@ -98,10 +98,12 @@ def angular_speed(pattern, base, t):
 
 
 class KnifeHitGame:
-    def __init__(self, screen, width, height):
+    def __init__(self, screen, width, height, reserved=None):
+        """reserved — занятая область окна (окно камеры): столбик ножей рисуется над ней."""
         self.screen = screen
         self.width = width
         self.height = height
+        self.icons_bottom = reserved.top - 24 if reserved else height - 60
         self.center = (width // 2, 250)
         self.start_tip_y = height - 180      # где ждёт следующий нож (острие)
 
@@ -383,7 +385,7 @@ class KnifeHitGame:
         # оставшиеся ножи — столбик иконок слева снизу
         total = self.cfg["knives"]
         for i in range(total):
-            y = self.height - 60 - i * 26
+            y = self.icons_bottom - i * 26
             color = (230, 230, 240) if i < self.knives_left else (70, 66, 90)
             pygame.draw.polygon(self.screen, color, [(22, y), (30, y - 5), (54, y - 5), (54, y + 5), (26, y + 5)])
             pygame.draw.rect(self.screen, color, (56, y - 3, 16, 7))

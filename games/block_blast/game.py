@@ -21,10 +21,12 @@ TEXT_COLOR = (40, 40, 40)
 
 
 class BlockBlastGame:
-    def __init__(self, screen, width, height):
+    def __init__(self, screen, width, height, reserved=None):
+        """reserved — занятая область окна (окно камеры): лоток с фигурами начинается правее неё."""
         self.screen = screen
         self.width = width
         self.height = height
+        self.tray_left = reserved.right + 10 if reserved else 0
         self.grid_origin = GRID_ORIGIN
         self.cell = CELL
         self.tray_y = self.grid_origin[1] + GRID_SIZE * CELL + 50
@@ -48,8 +50,8 @@ class BlockBlastGame:
     # ---------- координаты ----------
 
     def tray_slot_center(self, index):
-        slot_w = self.width // 3
-        x = slot_w * index + slot_w // 2
+        slot_w = (self.width - self.tray_left) // 3
+        x = self.tray_left + slot_w * index + slot_w // 2
         y = self.tray_y + 50
         return x, y
 

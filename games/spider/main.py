@@ -19,19 +19,25 @@
   G — режим ввода ГЛАЗА → МЫШЬ → КЛАВИШИ     ← → — выбрать колонку
   ПРОБЕЛ — взять / положить    D — раздача    U — отменить ход
   N — новая партия    1 / 2 / 4 — новая партия с 1 / 2 / 4 мастями
-  C — перекалибровать взгляд    ESC — выход
+  C — перекалибровать взгляд    K — окно камеры    ESC — выход
   Мышь: навести на колонку, ЛКМ — взять / положить, ПКМ — раздача
 """
 
 import math
+import os
 import sys
 import time
 
+# Корень проекта — в sys.path, чтобы найти общий пакет core/ (и при запуске
+# через launcher.py, и при запуске этого файла напрямую, например из PyCharm).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import pygame
 
-from blink_tracker import BlinkTracker
-from gaze_calibration import GazeCalibration
-from spider_game import CARD_W, COL_STEP, COLUMNS, LEFT, SpiderGame, column_x
+from core.blink_tracker import BlinkTracker
+from core.camera_preview import CameraPreview, preview_rect
+from core.gaze_calibration import GazeCalibration
+from game import CARD_W, COL_STEP, COLUMNS, LEFT, SpiderGame, column_x
 
 WINDOW_W, WINDOW_H = 1100, 800
 FPS = 60
@@ -115,8 +121,8 @@ class GazeColumnPicker:
 
 
 def draw_eye_hud(screen, font, gaze_u, closed_for, face_detected, gaze_mode):
-    """Внизу: шкала взгляда и прогресс «закройте глаза для раздачи»."""
-    y = WINDOW_H - 22
+    """Шкала взгляда (по верхнему краю окна) и прогресс «закройте глаза для раздачи»."""
+    y = 7
     left, right = column_x(0) + CARD_W // 2, column_x(COLUMNS - 1) + CARD_W // 2
     pygame.draw.line(screen, (0, 40, 20), (left, y), (right, y), 4)
     if gaze_mode == "ДЖОЙСТИК":
@@ -150,12 +156,13 @@ def main():
     font = pygame.font.SysFont("arial", 20)
     font_big = pygame.font.SysFont("arial", 40, bold=True)
 
-    game = SpiderGame(screen, WINDOW_W, WINDOW_H)
+    game = SpiderGame(screen, WINDOW_W, WINDOW_H, reserved=preview_rect(WINDOW_H))
     calibration = GazeCalibration(font, font_big, column_x(0) + CARD_W // 2,
                                   column_x(COLUMNS - 1) + CARD_W // 2, WINDOW_H // 2)
 
-    tracker = BlinkTracker(cam_index=0, show_debug=True)
+    tracker = BlinkTracker(cam_index=0)
     tracker.start()
+    preview = CameraPreview(tracker, WINDOW_H)
     gestures = EyeGestures()
     picker = GazeColumnPicker()
 
@@ -177,6 +184,8 @@ def main():
                     running = False
                 elif event.key == pygame.K_g:
                     mode = (mode + 1) % len(MODES)
+                elif event.key == pygame.K_k:
+                    preview.toggle()
                 elif event.key == pygame.K_v:
                     gaze_mode = "ДЖОЙСТИК" if gaze_mode == "ВЗГЛЯД" else "ВЗГЛЯД"
                 elif event.key == pygame.K_c:
@@ -240,10 +249,11 @@ def main():
 
         sub = f" / {gaze_mode} (V)" if eyes else ""
         mode_txt = (f"Ввод: {MODES[mode]}{sub}   G — сменить, C — калибровка, D — раздача, U — отмена, "
-                    f"N / 1 / 2 / 4 — новая партия")
+                    f"N / 1 / 2 / 4 — новая партия, K — камера")
         txt = font_small.render(mode_txt, True, (200, 225, 205))
-        screen.blit(txt, (LEFT, WINDOW_H - 56 if eyes else WINDOW_H - 30))
+        screen.blit(txt, (preview.rect.right + 12, WINDOW_H - 30))
 
+        preview.draw(screen)
         pygame.display.flip()
 
     tracker.stop()

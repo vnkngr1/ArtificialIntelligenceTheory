@@ -9,18 +9,25 @@ Knife Hit — Blink Edition
   Моргание (оба глаза) — бросить нож
   ПРОБЕЛ  — бросить нож с клавиатуры (для отладки без камеры)
   R       — начать заново
+  K       — показать / спрятать окно камеры
   ESC     — выход
 
 Если нож бросается от случайных морганий — увеличьте MIN_CLOSED_TIME:
 тогда засчитываются только нарочно долгие моргания.
 """
 
+import os
 import sys
+
+# Корень проекта — в sys.path, чтобы найти общий пакет core/ (и при запуске
+# через launcher.py, и при запуске этого файла напрямую, например из PyCharm).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pygame
 
-from blink_tracker import BlinkTracker
-from knife_game import KnifeHitGame
+from core.blink_tracker import BlinkTracker
+from core.camera_preview import CameraPreview, preview_rect
+from game import KnifeHitGame
 
 WINDOW_W, WINDOW_H = 560, 760
 FPS = 60
@@ -33,7 +40,7 @@ def draw_eye_indicator(screen, font, face_detected, score, closed):
     x, y = WINDOW_W - 60, WINDOW_H - 150
     if not face_detected:
         txt = font.render("Лицо не найдено в кадре камеры", True, (240, 90, 90))
-        screen.blit(txt, (WINDOW_W - txt.get_width() - 16, WINDOW_H - 56))
+        screen.blit(txt, (WINDOW_W - txt.get_width() - 16, WINDOW_H - 150))
         return
     openness = max(0.0, min(1.0, 1 - score))
     h = max(2, int(26 * openness))
@@ -52,10 +59,11 @@ def main():
     clock = pygame.time.Clock()
     font_small = pygame.font.SysFont("arial", 16)
 
-    game = KnifeHitGame(screen, WINDOW_W, WINDOW_H)
+    game = KnifeHitGame(screen, WINDOW_W, WINDOW_H, reserved=preview_rect(WINDOW_H))
 
-    tracker = BlinkTracker(cam_index=0, min_closed_time=MIN_CLOSED_TIME, show_debug=True)
+    tracker = BlinkTracker(cam_index=0, min_closed_time=MIN_CLOSED_TIME)
     tracker.start()
+    preview = CameraPreview(tracker, WINDOW_H)
     seen_blinks = 0
 
     running = True
@@ -70,6 +78,8 @@ def main():
                     running = False
                 elif event.key == pygame.K_SPACE:
                     game.throw()
+                elif event.key == pygame.K_k:
+                    preview.toggle()
                 elif event.key == pygame.K_r:
                     game.reset()
 
@@ -81,10 +91,14 @@ def main():
         game.update(dt)
         game.draw()
 
-        hint = font_small.render("Моргните — бросить нож  (ПРОБЕЛ, R — заново, ESC — выход)", True, (150, 146, 170))
-        screen.blit(hint, (WINDOW_W // 2 - hint.get_width() // 2, WINDOW_H - 28))
+        # подсказка справа от окна камеры
+        for i, line in enumerate(("Моргните — бросить нож",
+                                  "ПРОБЕЛ — с клавиатуры, R — заново, K — камера, ESC — выход")):
+            hint = font_small.render(line, True, (150, 146, 170))
+            screen.blit(hint, (WINDOW_W - hint.get_width() - 12, WINDOW_H - 52 + i * 22))
         draw_eye_indicator(screen, font_small, face_detected, score, closed)
 
+        preview.draw(screen)
         pygame.display.flip()
 
     tracker.stop()

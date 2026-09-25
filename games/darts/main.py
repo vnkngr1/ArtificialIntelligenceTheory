@@ -16,18 +16,25 @@
   G       — переключить режим ЖЕСТЫ / МЫШЬ (мышь: зажать ЛКМ = щипок,
             бросок — резкий взмах мышью вверх с отпусканием кнопки)
   A       — перенацелиться (вернуться к шагу 1)
+  K       — показать / спрятать окно камеры
   R       — начать заново
   ESC     — выход
 """
 
+import os
 import sys
 import time
 from collections import deque
 
+# Корень проекта — в sys.path, чтобы найти общий пакет core/ (и при запуске
+# через launcher.py, и при запуске этого файла напрямую, например из PyCharm).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import pygame
 
-from darts_game import BOARD_AREA, DartsGame, ThrowMotion
-from gesture_tracker import GestureTracker
+from game import BOARD_AREA, DartsGame, ThrowMotion
+from core.camera_preview import CameraPreview, hand_status
+from core.gesture_tracker import GestureTracker, PinchHysteresis
 
 WINDOW_W, WINDOW_H = 1100, 760
 FPS = 60
@@ -98,19 +105,6 @@ class PinchInput:
         return estimate_motion(self.trail)
 
 
-class PinchHysteresis:
-    def __init__(self):
-        self.closed = False
-
-    def update(self, sample):
-        if not sample.detected or sample.hand_size < 1e-6:
-            self.closed = False
-        else:
-            ratio = sample.pinch_dist / sample.hand_size
-            self.closed = ratio < (PINCH_OPEN_RATIO if self.closed else PINCH_CLOSE_RATIO)
-        return self.closed
-
-
 def cam_to_screen(x, y):
     """Центральная часть кадра камеры → область мишени в окне."""
     def norm(v):
@@ -136,12 +130,14 @@ def main():
 
     game = DartsGame(screen, WINDOW_W, WINDOW_H)
 
-    tracker = GestureTracker(cam_index=0, show_debug=True)
+    tracker = GestureTracker(cam_index=0)
     tracker.start()
+    preview = CameraPreview(tracker, WINDOW_H)
+    text_x = preview.rect.right + 12
 
     cam_input = PinchInput(CAM_SMOOTHING)
     mouse_input = PinchInput(1.0)
-    pinch = PinchHysteresis()
+    pinch = PinchHysteresis(PINCH_CLOSE_RATIO, PINCH_OPEN_RATIO)
     last_sample_t = 0.0
 
     use_gesture = True
@@ -157,6 +153,8 @@ def main():
                     running = False
                 elif event.key == pygame.K_g:
                     use_gesture = not use_gesture
+                elif event.key == pygame.K_k:
+                    preview.toggle()
                 elif event.key == pygame.K_r:
                     game.reset()
                 elif event.key == pygame.K_a:
@@ -183,12 +181,13 @@ def main():
         game.update(dt)
         game.draw(cursor, hand.pinching, hand.motion() if hand.pinching else None)
 
-        mode_txt = f"Режим: {'ЖЕСТЫ' if use_gesture else 'МЫШЬ'}  (G — переключить, A — прицел, R — заново, ESC — выход)"
-        screen.blit(font_small.render(mode_txt, True, (150, 156, 170)), (10, WINDOW_H - 26))
+        mode_txt = f"Режим: {'ЖЕСТЫ' if use_gesture else 'МЫШЬ'}  (G — сменить, A — прицел, R — заново, K — камера, ESC — выход)"
+        screen.blit(font_small.render(mode_txt, True, (150, 156, 170)), (text_x, WINDOW_H - 26))
         if use_gesture and not hand.detected:
             warn = font_small.render("Рука не найдена в кадре камеры", True, (240, 90, 90))
-            screen.blit(warn, (10, WINDOW_H - 48))
+            screen.blit(warn, (text_x, WINDOW_H - 48))
 
+        preview.draw(screen, hand_status(cam_input.detected, cam_input.pinching))
         pygame.display.flip()
 
     tracker.stop()
