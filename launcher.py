@@ -410,7 +410,7 @@ class Launcher:
         pygame.draw.circle(self.screen, color, (26, 28), 6)
         self.screen.blit(self.font.render(status, True, color), (38, 18))
 
-        self.preview.draw(self.screen, hand_status(self.hand_detected, self.pinching))
+        self.preview.draw(self.screen, hand_status(self.hand_detected, self.pinching, self.pinch.ratio))
         self._draw_cursor()
 
     def _draw_list(self):

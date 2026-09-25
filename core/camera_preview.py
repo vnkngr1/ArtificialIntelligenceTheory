@@ -31,11 +31,13 @@ def preview_rect(screen_height):
     return pygame.Rect(MARGIN, screen_height - h - MARGIN, w, h)
 
 
-def hand_status(detected, pinching):
-    """Подпись для игр, которые сами определяют щипок (PinchHysteresis)."""
+def hand_status(detected, pinching, ratio=None):
+    """Подпись окна камеры для рук. ratio — отношение «расстояние между пальцами /
+    размер руки» (PinchHysteresis.ratio): по нему удобно подбирать пороги щипка."""
+    suffix = f"  {ratio:.2f}" if ratio is not None and detected else ""
     if pinching:
-        return "ЩИПОК", PINCH_COLOR
-    return ("РУКА", HAND_COLOR) if detected else ("НЕТ РУКИ", NO_HAND_COLOR)
+        return "ЩИПОК" + suffix, PINCH_COLOR
+    return ("РУКА" + suffix, HAND_COLOR) if detected else ("НЕТ РУКИ", NO_HAND_COLOR)
 
 
 class CameraPreview:

@@ -43,12 +43,6 @@ from core.one_euro import OneEuroFilter2D
 WINDOW_W, WINDOW_H = 1100, 760
 FPS = 60
 
-# Щипок определяем по отношению «расстояние между пальцами / размер руки»:
-# в отличие от абсолютного порога, оно не меняется, когда рука при броске
-# приближается к камере. Два порога (гистерезис) — чтобы щипок не «мигал».
-PINCH_CLOSE_RATIO = 0.30
-PINCH_OPEN_RATIO = 0.45
-
 CAM_MIN_CUTOFF = 0.5    # фильтр One Euro для прицела: меньше — меньше дрожания в покое
 CAM_BETA = 10.0         # больше — меньше запаздывания при быстром движении
 CAM_MARGIN = 0.12       # края кадра, до которых рука дотягивается с трудом
@@ -141,7 +135,9 @@ def main():
 
     cam_input = PinchInput(OneEuroFilter2D(CAM_MIN_CUTOFF, CAM_BETA))
     mouse_input = PinchInput()
-    pinch = PinchHysteresis(PINCH_CLOSE_RATIO, PINCH_OPEN_RATIO)
+    # щипок — по отношению «расстояние между пальцами / размер руки»: оно не меняется,
+    # когда рука при броске приближается к камере (пороги — в core/gesture_tracker.py)
+    pinch = PinchHysteresis()
     last_sample_t = 0.0
 
     use_gesture = True
@@ -191,7 +187,7 @@ def main():
             warn = font_small.render("Рука не найдена в кадре камеры", True, (240, 90, 90))
             screen.blit(warn, (text_x, WINDOW_H - 48))
 
-        preview.draw(screen, hand_status(cam_input.detected, cam_input.pinching))
+        preview.draw(screen, hand_status(cam_input.detected, cam_input.pinching, pinch.ratio))
         if exit_gesture.update(dt, tracker):
             running = False
         exit_gesture.draw(screen)

@@ -54,6 +54,15 @@ MIDDLE_MCP = 9
 # пары (кончик, средний сустав) для указательного, среднего, безымянного пальцев и мизинца
 FINGERS = {"index": (8, 6), "middle": (12, 10), "ring": (16, 14), "pinky": (20, 18)}
 
+# Щипок: отношение «расстояние между кончиками большого и указательного / размер
+# руки (запястье → основание среднего пальца)». Щипок — отношение от 0 до 0.25
+# (размер руки ~9–10 см, так что 0.25 ≈ 2.5 см между точками кончиков; точки
+# MediaPipe стоят в середине подушечек, а не на поверхности). Разжатие — выше
+# 0.28: небольшой запас (гистерезис) не даёт щипку «мигать», когда пальцы
+# держат ровно на границе. Текущее отношение видно в окне камеры.
+PINCH_CLOSE_RATIO = 0.25
+PINCH_OPEN_RATIO = 0.28
+
 PREVIEW_WIDTH = 320     # ширина кадра для окна камеры в интерфейсе (высота — по пропорциям камеры)
 
 # Пары точек для отрисовки скелета руки в отладочном окне
@@ -83,9 +92,24 @@ class HandSample:
     detected: bool        # видна ли рука
     x: float = 0.5        # точка щипка — середина между кончиками большого и указательного
     y: float = 0.5
-    pinch_dist: float = 1.0   # расстояние между кончиками большого и указательного
-    hand_size: float = 0.0    # запястье → основание среднего пальца (масштаб руки:
+    pinch_dist: float = 1.0   # расстояние между кончиками большого и указательного, px (3D)
+    hand_size: float = 0.0    # запястье → основание среднего пальца, px (3D; масштаб руки:
                               # растёт, когда рука приближается к камере)
+
+    @property
+    def pinch_ratio(self):
+        """Расстояние между пальцами относительно размера руки (не зависит от удалённости от камеры)."""
+        return self.pinch_dist / self.hand_size if self.detected and self.hand_size > 1e-6 else None
+
+
+def landmark_dist(a, b, w, h):
+    """Расстояние между точками руки в пикселях кадра, с учётом глубины z.
+
+    x и y у MediaPipe нормализованы на ширину и высоту кадра по отдельности —
+    без пересчёта в пиксели расстояние зависело бы от поворота руки. z — глубина
+    в тех же единицах, что x: без неё пальцы, стоящие друг за другом вдоль
+    направления на камеру, казались бы сомкнутыми."""
+    return math.sqrt(((a.x - b.x) * w) ** 2 + ((a.y - b.y) * h) ** 2 + ((a.z - b.z) * w) ** 2)
 
 
 def middle_finger_up(lm):
@@ -113,33 +137,37 @@ def middle_finger_up(lm):
 class PinchHysteresis:
     """Щипок по отношению «расстояние между пальцами / размер руки» с двумя порогами.
 
-    В отличие от абсолютного порога pinch_threshold, отношение не меняется,
-    когда рука приближается к камере или отдаляется от неё, а гистерезис
-    (сжать — ниже close_ratio, разжать — выше open_ratio) не даёт щипку
-    «мигать» на границе."""
+    Отношение не меняется, когда рука приближается к камере или отдаляется от
+    неё, а гистерезис (сжать — ниже close_ratio, разжать — выше open_ratio) не
+    даёт щипку «мигать» на границе. Пороги по умолчанию — PINCH_CLOSE_RATIO /
+    PINCH_OPEN_RATIO, общие для всех игр."""
 
-    def __init__(self, close_ratio=0.30, open_ratio=0.45):
+    def __init__(self, close_ratio=PINCH_CLOSE_RATIO, open_ratio=PINCH_OPEN_RATIO):
         self.close_ratio = close_ratio
         self.open_ratio = open_ratio
         self.closed = False
+        self.ratio = None          # последнее отношение — для подписи в окне камеры
 
     def update(self, sample):
         """sample — HandSample; возвращает, сжаты ли пальцы."""
-        if not sample.detected or sample.hand_size < 1e-6:
+        self.ratio = sample.pinch_ratio
+        if self.ratio is None:
             self.closed = False
         else:
-            ratio = sample.pinch_dist / sample.hand_size
-            self.closed = ratio < (self.open_ratio if self.closed else self.close_ratio)
+            self.closed = self.ratio < (self.open_ratio if self.closed else self.close_ratio)
         return self.closed
 
 
 class GestureTracker:
-    def __init__(self, cam_index=0, pinch_threshold=0.055, preview=True, min_cutoff=0.5, beta=10.0):
+    def __init__(self, cam_index=0, preview=True, min_cutoff=0.5, beta=10.0,
+                 close_ratio=PINCH_CLOSE_RATIO, open_ratio=PINCH_OPEN_RATIO):
         """min_cutoff / beta — параметры фильтра One Euro для курсора: меньше min_cutoff —
-        меньше дрожания в покое, больше beta — меньше запаздывания при быстром движении."""
+        меньше дрожания в покое, больше beta — меньше запаздывания при быстром движении.
+        close_ratio / open_ratio — пороги щипка для get_state() (см. PINCH_CLOSE_RATIO)."""
         self.cam_index = cam_index
+        self._pinch = PinchHysteresis(close_ratio, open_ratio)
+        self._pinch_ratio = None
         self._filter = OneEuroFilter2D(min_cutoff, beta)
-        self.pinch_threshold = pinch_threshold
         self.preview = preview              # готовить кадры для окна камеры в интерфейсе
         self.error = None                   # текст ошибки, если камера или модель недоступны
 
@@ -198,9 +226,9 @@ class GestureTracker:
     def preview_status(self):
         """Подпись для окна камеры: (текст, цвет RGB)."""
         with self._lock:
-            if self._pinching:
-                return "ЩИПОК", (90, 230, 120)
-            return ("РУКА", (90, 200, 255)) if self._hand_detected else ("НЕТ РУКИ", (255, 110, 110))
+            detected, pinching, ratio = self._hand_detected, self._pinching, self._pinch_ratio
+        from .camera_preview import hand_status     # тут, чтобы трекер не тянул pygame при импорте
+        return hand_status(detected, pinching, ratio)
 
     def _store_preview(self, frame, lm):
         """Уменьшает кадр и рисует на нём скелет руки — для окна камеры в интерфейсе."""
@@ -284,19 +312,17 @@ class GestureTracker:
                 raw_x = index_tip.x
                 raw_y = index_tip.y
 
-                dist = math.hypot(thumb_tip.x - index_tip.x, thumb_tip.y - index_tip.y)
-                pinching = dist < self.pinch_threshold
                 exit_gesture = middle_finger_up(lm)
-
-                wrist, middle_mcp = lm[WRIST], lm[MIDDLE_MCP]
+                h, w = frame.shape[:2]
                 sample = HandSample(
                     t=frame_t,
                     detected=True,
                     x=(thumb_tip.x + index_tip.x) / 2,
                     y=(thumb_tip.y + index_tip.y) / 2,
-                    pinch_dist=dist,
-                    hand_size=math.hypot(wrist.x - middle_mcp.x, wrist.y - middle_mcp.y),
+                    pinch_dist=landmark_dist(thumb_tip, index_tip, w, h),
+                    hand_size=landmark_dist(lm[WRIST], lm[MIDDLE_MCP], w, h),
                 )
+            pinching = self._pinch.update(sample)
 
             # сглаживание One Euro: в покое курсор не дрожит, при быстром движении не отстаёт
             self._smooth_x, self._smooth_y = self._filter(raw_x, raw_y, frame_t)
@@ -305,6 +331,7 @@ class GestureTracker:
                 self._cursor_x = self._smooth_x
                 self._cursor_y = self._smooth_y
                 self._pinching = pinching
+                self._pinch_ratio = self._pinch.ratio
                 self._hand_detected = hand_detected
                 self._exit_gesture = exit_gesture
                 self._frames += 1

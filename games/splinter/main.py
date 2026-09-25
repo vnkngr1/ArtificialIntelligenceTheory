@@ -135,7 +135,7 @@ def main():
             warn = font_small.render("Рука не найдена в кадре камеры", True, (255, 120, 120))
             screen.blit(warn, (preview.rect.right + 12, WINDOW_H - 58))
 
-        preview.draw(screen, hand_status(hand_detected, pinching) if use_gesture else None)
+        preview.draw(screen, hand_status(hand_detected, pinching, pinch.ratio) if use_gesture else None)
         if exit_gesture.update(dt, tracker):
             running = False
         exit_gesture.draw(screen)
