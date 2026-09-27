@@ -16,6 +16,10 @@ mediapipe.tasks.python.vision.HandLandmarker. Он требует отдельн
 
 exit_gesture() — показан ли жест выхода «средний палец» (см. core/exit_gesture.py).
 
+С num_hands=2 трекер ведёт две руки сразу (например, два игрока перед одной
+камерой): get_hands_since(t) отдаёт все руки каждого кадра. Всё остальное
+(get_state, get_samples_since) по-прежнему про первую найденную руку.
+
 Дополнительно трекер хранит буфер последних кадров (HandSample) с точным
 временем съёмки — get_samples_since(t). Он нужен играм, которым важна
 скорость движения руки (например, бросок в дартсе).
@@ -134,6 +138,19 @@ def middle_finger_up(lm):
     return extended("middle") and folded("index") and folded("ring") and folded("pinky")
 
 
+def hand_sample(lm, t, w, h):
+    """HandSample по 21 точке руки; w, h — размер кадра в пикселях."""
+    thumb_tip, index_tip = lm[THUMB_TIP], lm[INDEX_TIP]
+    return HandSample(
+        t=t,
+        detected=True,
+        x=(thumb_tip.x + index_tip.x) / 2,
+        y=(thumb_tip.y + index_tip.y) / 2,
+        pinch_dist=landmark_dist(thumb_tip, index_tip, w, h),
+        hand_size=landmark_dist(lm[WRIST], lm[MIDDLE_MCP], w, h),
+    )
+
+
 class PinchHysteresis:
     """Щипок по отношению «расстояние между пальцами / размер руки» с двумя порогами.
 
@@ -160,11 +177,13 @@ class PinchHysteresis:
 
 class GestureTracker:
     def __init__(self, cam_index=0, preview=True, min_cutoff=0.5, beta=10.0,
-                 close_ratio=PINCH_CLOSE_RATIO, open_ratio=PINCH_OPEN_RATIO):
+                 close_ratio=PINCH_CLOSE_RATIO, open_ratio=PINCH_OPEN_RATIO, num_hands=1):
         """min_cutoff / beta — параметры фильтра One Euro для курсора: меньше min_cutoff —
         меньше дрожания в покое, больше beta — меньше запаздывания при быстром движении.
-        close_ratio / open_ratio — пороги щипка для get_state() (см. PINCH_CLOSE_RATIO)."""
+        close_ratio / open_ratio — пороги щипка для get_state() (см. PINCH_CLOSE_RATIO).
+        num_hands — сколько рук искать в кадре (2 — для игр на двоих)."""
         self.cam_index = cam_index
+        self.num_hands = num_hands
         self._pinch = PinchHysteresis(close_ratio, open_ratio)
         self._pinch_ratio = None
         self._filter = OneEuroFilter2D(min_cutoff, beta)
@@ -177,6 +196,7 @@ class GestureTracker:
         self._pinching = False
         self._hand_detected = False
         self._samples = deque(maxlen=120)  # ~4 секунды истории при 30 FPS
+        self._hands = deque(maxlen=120)    # (время кадра, [HandSample каждой найденной руки])
         self._preview = None
         self._preview_id = 0
 
@@ -218,8 +238,13 @@ class GestureTracker:
         with self._lock:
             return [s for s in self._samples if s.t > t]
 
+    def get_hands_since(self, t):
+        """Все руки каждого кадра, снятого позже момента t: [(время, [HandSample, ...]), ...]."""
+        with self._lock:
+            return [(ft, hands) for ft, hands in self._hands if ft > t]
+
     def get_preview(self):
-        """(номер кадра, RGB-кадр numpy HxWx3 с нарисованной рукой); (0, None), пока кадров нет."""
+        """(номер кадра, RGB-кадр numpy HxWx3 с нарисованными руками); (0, None), пока кадров нет."""
         with self._lock:
             return self._preview_id, self._preview
 
@@ -230,12 +255,12 @@ class GestureTracker:
         from .camera_preview import hand_status     # тут, чтобы трекер не тянул pygame при импорте
         return hand_status(detected, pinching, ratio)
 
-    def _store_preview(self, frame, lm):
-        """Уменьшает кадр и рисует на нём скелет руки — для окна камеры в интерфейсе."""
+    def _store_preview(self, frame, hands):
+        """Уменьшает кадр и рисует на нём скелеты рук — для окна камеры в интерфейсе."""
         h, w = frame.shape[:2]
         pw, ph = PREVIEW_WIDTH, int(PREVIEW_WIDTH * h / w)
         small = cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA)
-        if lm is not None:
+        for lm in hands:
             pts = [(int(p.x * pw), int(p.y * ph)) for p in lm]
             for a, b in HAND_CONNECTIONS:
                 cv2.line(small, pts[a], pts[b], (0, 200, 0), 2, cv2.LINE_AA)
@@ -261,7 +286,7 @@ class GestureTracker:
         base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
         options = mp_vision.HandLandmarkerOptions(
             base_options=base_options,
-            num_hands=1,
+            num_hands=self.num_hands,
             running_mode=mp_vision.RunningMode.VIDEO,
             min_hand_detection_confidence=0.6,
             min_hand_presence_confidence=0.6,
@@ -304,24 +329,14 @@ class GestureTracker:
 
             if result.hand_landmarks:
                 hand_detected = True
-                lm = result.hand_landmarks[0]  # список из 21 точки текущей руки
-
-                thumb_tip = lm[THUMB_TIP]
-                index_tip = lm[INDEX_TIP]
-
-                raw_x = index_tip.x
-                raw_y = index_tip.y
-
-                exit_gesture = middle_finger_up(lm)
-                h, w = frame.shape[:2]
-                sample = HandSample(
-                    t=frame_t,
-                    detected=True,
-                    x=(thumb_tip.x + index_tip.x) / 2,
-                    y=(thumb_tip.y + index_tip.y) / 2,
-                    pinch_dist=landmark_dist(thumb_tip, index_tip, w, h),
-                    hand_size=landmark_dist(lm[WRIST], lm[MIDDLE_MCP], w, h),
-                )
+                lm = result.hand_landmarks[0]  # список из 21 точки первой найденной руки
+                raw_x, raw_y = lm[INDEX_TIP].x, lm[INDEX_TIP].y
+                exit_gesture = any(middle_finger_up(hand) for hand in result.hand_landmarks)
+            h, w = frame.shape[:2]
+            all_hands = result.hand_landmarks or []
+            hand_samples = [hand_sample(hand, frame_t, w, h) for hand in all_hands]
+            if hand_samples:
+                sample = hand_samples[0]
             pinching = self._pinch.update(sample)
 
             # сглаживание One Euro: в покое курсор не дрожит, при быстром движении не отстаёт
@@ -336,9 +351,10 @@ class GestureTracker:
                 self._exit_gesture = exit_gesture
                 self._frames += 1
                 self._samples.append(sample)
+                self._hands.append((frame_t, hand_samples))
 
             if self.preview:
-                self._store_preview(frame, lm)
+                self._store_preview(frame, all_hands)
 
         landmarker.close()
         cap.release()

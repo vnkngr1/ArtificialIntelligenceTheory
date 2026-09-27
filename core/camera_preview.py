@@ -41,9 +41,14 @@ def hand_status(detected, pinching, ratio=None):
 
 
 class CameraPreview:
-    def __init__(self, tracker, screen_height, visible=True):
+    def __init__(self, tracker, screen_height, visible=True, rect=None, crop_x=(0.0, 1.0), border=None):
+        """rect — своё место окна (по умолчанию — левый нижний угол); crop_x — какую часть
+        кадра по ширине показывать (например, (0, 0.5) — левую половину: для игр на двоих
+        у каждого игрока своё окно); border — цвет рамки."""
         self.tracker = tracker
-        self.rect = preview_rect(screen_height)
+        self.rect = rect or preview_rect(screen_height)
+        self.crop_x = crop_x
+        self.border = border
         self.visible = visible
         self.font = pygame.font.SysFont("arial", 12, bold=True)
         self.font_msg = pygame.font.SysFont("arial", 14)
@@ -81,7 +86,8 @@ class CameraPreview:
             txt = self.font_msg.render(text, True, (255, 130, 130) if error else (200, 205, 215))
             screen.blit(txt, txt.get_rect(center=r.center))
 
-        pygame.draw.rect(screen, (90, 96, 120), r.inflate(2, 2), 2, border_radius=11)
+        pygame.draw.rect(screen, self.border or (90, 96, 120), r.inflate(2, 2), 3 if self.border else 2,
+                         border_radius=11)
         if self._surface is None:
             return                                  # пока кадров нет — без подписи
         if status is None:
@@ -96,8 +102,12 @@ class CameraPreview:
 
     def _to_surface(self, frame):
         """numpy RGB → поверхность размера окна: заполнить с обрезкой по центру, скруглить углы."""
+        c0, c1 = self.crop_x
+        if (c0, c1) != (0.0, 1.0):
+            full_w = frame.shape[1]
+            frame = frame[:, int(full_w * c0):int(full_w * c1)]
         h, w = frame.shape[:2]
-        image = pygame.image.frombuffer(frame.tobytes(), (w, h), "RGB")
+        image = pygame.image.frombuffer(frame.copy().tobytes(), (w, h), "RGB")
         pw, ph = self.rect.size
         k = max(pw / w, ph / h)
         scaled = pygame.transform.smoothscale(image, (max(pw, round(w * k)), max(ph, round(h * k))))
