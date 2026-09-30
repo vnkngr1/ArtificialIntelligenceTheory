@@ -7,7 +7,9 @@
 (ICON), описание (DESCRIPTION), чем управлять (CONTROLS) и порядок (ORDER).
 Чтобы добавить игру — достаточно положить новую папку, лаунчер трогать не нужно.
 
-Игры показаны списком, который прокручивается:
+Игры показаны списком, разбитым на группы по способу управления (поле
+CONTROLS в config.py): «Управление рукой», «Управление глазами». Список
+прокручивается:
   - щипок на игре и удержание, пока не заполнится круг, — запуск;
   - щипок ВНЕ игр (по бокам списка, между строками) и движение руки вверх/вниз —
     список тянется за рукой, после отпускания немного прокатывается по инерции;
@@ -73,6 +75,14 @@ TEXT = (240, 242, 248)
 MUTED = (150, 156, 180)
 BADGE_COLORS = {"рука": (70, 160, 110), "глаза": (90, 120, 210)}
 
+# Группы в списке — по способу управления: (CONTROLS, заголовок, пояснение)
+GROUPS = [
+    ("рука", "Управление рукой", "положение руки, щипок, взмах"),
+    ("глаза", "Управление глазами", "взгляд, моргание, наклон головы"),
+]
+OTHER_GROUP = ("", "Другие игры", "")
+HEADER_H, GROUP_GAP = 58, 18
+
 
 # ---------- игры ----------
 
@@ -106,8 +116,36 @@ def discover_games():
             print(f"[launcher] Пропускаю {folder}: ошибка в config.py — {exc}")
             continue
         games.append(GameEntry(folder, config))
-    games.sort(key=lambda g: (g.order, g.name))
+    games.sort(key=lambda g: (group_index(g.controls), g.order, g.name))
     return games
+
+
+def group_index(controls):
+    for i, (key, _, _) in enumerate(GROUPS):
+        if key == controls:
+            return i
+    return len(GROUPS)
+
+
+def group_of(controls):
+    i = group_index(controls)
+    return GROUPS[i] if i < len(GROUPS) else OTHER_GROUP
+
+
+def build_layout(games):
+    """Позиции в списке: заголовки групп и строки игр (y от начала списка) и полная высота."""
+    headers, rows, y, current = [], [], 0, None
+    for game in games:
+        group = group_of(game.controls)
+        if group != current:
+            if current is not None:
+                y += GROUP_GAP
+            headers.append((group, y))
+            y += HEADER_H
+            current = group
+        rows.append(y)
+        y += ITEM_H + ITEM_GAP
+    return headers, rows, max(0, y - ITEM_GAP)
 
 
 def load_icon(game, size, font):
@@ -157,6 +195,7 @@ class Launcher:
         self.font_icon = pygame.font.SysFont("arial", 60, bold=True)
 
         self.games = discover_games()
+        self.headers, self.rows, self.content_height = build_layout(self.games)
         self.selected = 0
         self.scroll = 0.0
         self.velocity = 0.0          # инерция прокрутки, px/с
@@ -214,11 +253,10 @@ class Launcher:
 
     @property
     def max_scroll(self):
-        content = len(self.games) * (ITEM_H + ITEM_GAP) - ITEM_GAP
-        return max(0.0, content - VIEW.height + 16)
+        return max(0.0, self.content_height - VIEW.height + 16)
 
     def item_rect(self, i):
-        y = VIEW.top + 8 + i * (ITEM_H + ITEM_GAP) - self.scroll
+        y = VIEW.top + 8 + self.rows[i] - self.scroll
         return pygame.Rect(LIST_X, round(y), ITEM_W, ITEM_H)
 
     def item_at(self, pos):
@@ -236,8 +274,8 @@ class Launcher:
 
     def _ensure_visible(self, i):
         r = self.item_rect(i)
-        if r.top < VIEW.top:
-            self.scroll -= VIEW.top - r.top + 8
+        if r.top < VIEW.top + HEADER_H:          # сверху оставим место, чтобы был виден заголовок группы
+            self.scroll -= VIEW.top + HEADER_H - r.top + 8
         elif r.bottom > VIEW.bottom:
             self.scroll += r.bottom - VIEW.bottom + 8
         self._clamp_scroll()
@@ -417,6 +455,10 @@ class Launcher:
         self.screen.set_clip(VIEW)
         hold_item = self.press["item"] if self.press and self.press["kind"] == "item" else None
         hold = self.press.get("hold", 0.0) if hold_item is not None else 0.0
+        for (key, title, subtitle), y in self.headers:
+            top = VIEW.top + 8 + y - self.scroll
+            if -HEADER_H < top - VIEW.top < VIEW.height:
+                self._draw_header(key, title, subtitle, top)
         for i, game in enumerate(self.games):
             r = self.item_rect(i)
             if r.bottom < VIEW.top or r.top > VIEW.bottom:
@@ -444,9 +486,23 @@ class Launcher:
             pygame.draw.rect(self.screen, ACCENT if dragging else (130, 136, 170),
                              (track.left, thumb_y, track.width, thumb_h), border_radius=3)
 
+    def _draw_header(self, key, title, subtitle, top):
+        """Заголовок группы: цветная метка, название и пояснение, линия до правого края списка."""
+        color = BADGE_COLORS.get(key, (130, 136, 160))
+        pygame.draw.rect(self.screen, color, (LIST_X, top + 12, 8, 30), border_radius=4)
+        name = self.font_name.render(title, True, color)
+        self.screen.blit(name, (LIST_X + 20, top + 8))
+        if subtitle:
+            sub = self.font.render(subtitle, True, MUTED)
+            self.screen.blit(sub, (LIST_X + 30 + name.get_width(), top + 14))
+        pygame.draw.line(self.screen, (60, 66, 92), (LIST_X, top + HEADER_H - 8),
+                         (LIST_X + ITEM_W, top + HEADER_H - 8), 1)
+
     def _draw_item(self, game, r, active, hold):
         pygame.draw.rect(self.screen, (8, 9, 14), r.move(0, 5), border_radius=20)
         pygame.draw.rect(self.screen, TILE_HOVER if active else TILE, r, border_radius=20)
+        stripe = pygame.Rect(r.left, r.top + 18, 6, r.height - 36)                     # полоса цвета группы
+        pygame.draw.rect(self.screen, BADGE_COLORS.get(game.controls, (130, 136, 160)), stripe, border_radius=3)
         if active:
             pygame.draw.rect(self.screen, ACCENT, r, 3, border_radius=20)
 

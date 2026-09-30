@@ -19,6 +19,10 @@ FaceLandmarker кроме 478 точек лица умеет выдавать «
 дополнительно раз в несколько кадров ищет руку моделью HandLandmarker —
 exit_gesture().
 
+Для игр «посмотри вниз» — get_look(): признаки того, куда смотрит человек по
+вертикали (см. look_features). С head_pose=True модель дополнительно отдаёт
+матрицу поворота головы, из неё берётся наклон головы.
+
 Работает в отдельном потоке, как и GestureTracker. Наружу отдаёт get_state():
     face_detected — видно ли лицо
     closed_score  — насколько закрыты глаза, 0..1
@@ -39,6 +43,7 @@ import threading
 import time
 
 import cv2
+import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -63,6 +68,26 @@ PREVIEW_SIZE = (320, 240)   # кадр для окна камеры в инте�
 HAND_EVERY = 3              # руку (жест выхода) ищем в каждом 3-м кадре — это дешевле
 
 
+def look_features(lm, shapes, matrix=None):
+    """Признаки взгляда вниз: (глаза вниз, наклон по точкам лица, наклон головы по матрице).
+
+    - глаза: коэффициенты мимики eyeLookDown минус eyeLookUp (0..1 у MediaPipe);
+    - наклон по точкам: где кончик носа (1) между переносицей (168) и подбородком (152),
+      относительно высоты лица (лоб 10 — подбородок 152); при наклоне головы он меняется;
+    - наклон по матрице поворота головы, градусы (None, если матрицы нет).
+    В какую сторону меняется каждый признак и насколько сильно — у каждого человека и
+    камеры своё, поэтому игра сначала калибруется («смотрите на экран» / «смотрите вниз»)."""
+    eyes = ((shapes.get("eyeLookDownLeft", 0.0) + shapes.get("eyeLookDownRight", 0.0))
+            - (shapes.get("eyeLookUpLeft", 0.0) + shapes.get("eyeLookUpRight", 0.0))) / 2
+    face_h = lm[152].y - lm[10].y
+    nose = (lm[1].y - lm[168].y) / face_h if abs(face_h) > 1e-6 else 0.0
+    pitch = None
+    if matrix is not None:
+        m = np.asarray(matrix)
+        pitch = float(np.degrees(np.arctan2(m[2, 1], m[2, 2])))
+    return eyes, nose, pitch
+
+
 def gaze_ratio(lm):
     """Положение зрачков между уголками глаз по горизонтали (среднее по двум глазам)."""
     if len(lm) <= max(IRIS_CENTERS):
@@ -81,7 +106,7 @@ def gaze_ratio(lm):
 
 class BlinkTracker:
     def __init__(self, cam_index=0, close_threshold=0.5, open_threshold=0.35,
-                 min_closed_time=0.0, preview=True, exit_gesture=True):
+                 min_closed_time=0.0, preview=True, exit_gesture=True, head_pose=False):
         """
         close_threshold — глаза считаются закрытыми выше этого значения
                           (не ниже «открытого» уровня + 0.25);
@@ -90,7 +115,8 @@ class BlinkTracker:
                           засчитать моргание. 0 — мгновенно. ~0.25 — только
                           нарочно долгое моргание, случайные не срабатывают;
         preview         — готовить кадры для окна камеры в интерфейсе;
-        exit_gesture    — искать руку и жест выхода «средний палец».
+        exit_gesture    — искать руку и жест выхода «средний палец»;
+        head_pose       — считать наклон головы (матрица поворота) для get_look().
         """
         self.cam_index = cam_index
         self.close_threshold = close_threshold
@@ -98,6 +124,7 @@ class BlinkTracker:
         self.min_closed_time = min_closed_time
         self.preview = preview
         self.detect_exit = exit_gesture
+        self.head_pose = head_pose
         self.error = None            # текст ошибки, если камера или модель недоступны
 
         self._lock = threading.Lock()
@@ -106,6 +133,7 @@ class BlinkTracker:
         self._closed = False
         self._blink_count = 0
         self._gaze = None
+        self._look = None
         self._preview = None
         self._preview_id = 0
         self._crop = None            # сглаженная рамка обрезки вокруг лица: (cx, cy, ширина)
@@ -133,6 +161,11 @@ class BlinkTracker:
         """Возвращает (face_detected, closed_score, eyes_closed, blink_count)."""
         with self._lock:
             return self._face_detected, self._score, self._closed, self._blink_count
+
+    def get_look(self):
+        """Признаки взгляда вниз (см. look_features) последнего кадра или None, если лица нет."""
+        with self._lock:
+            return self._look if self._face_detected else None
 
     def get_gaze(self):
         """Последнее положение зрачков (см. gaze_ratio) или None, если лица нет.
@@ -231,6 +264,7 @@ class BlinkTracker:
             running_mode=mp_vision.RunningMode.VIDEO,
             num_faces=1,
             output_face_blendshapes=True,
+            output_facial_transformation_matrixes=self.head_pose,
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -289,6 +323,10 @@ class BlinkTracker:
                     gaze = gaze_ratio(result.face_landmarks[0]) if result.face_landmarks else None
                     if gaze is not None and not self._closed and self._score < self.open_threshold:
                         self._gaze = gaze
+                    if result.face_landmarks:
+                        matrices = getattr(result, "facial_transformation_matrixes", None)
+                        self._look = look_features(result.face_landmarks[0], shapes,
+                                                   matrices[0] if matrices else None)
                 else:
                     self._closed = False
 
